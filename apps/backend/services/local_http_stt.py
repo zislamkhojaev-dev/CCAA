@@ -12,11 +12,13 @@ import asyncio
 import io
 import time
 import wave
+from array import array
 from typing import AsyncIterator
 
 import httpx
 
 from apps.backend.config import get_settings
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.services.interfaces import STTEvent, STTService
 from apps.backend.utils.logging import get_logger
 
@@ -51,10 +53,18 @@ class LocalHttpSTT(STTService):
         last_chunk_at = time.monotonic()
 
         async def flush_buf(reason: str) -> None:
+            nonlocal voiced_bytes
+            rt = get_bot_runtime_payload_sync()
+            min_voiced_sec = max(0.05, float(rt.get("stt_min_voiced_seconds", 0.2)))
             if len(buf) < sample_rate:
+                return
+            if voiced_bytes < int(sample_rate * 2 * min_voiced_sec):
+                buf.clear()
+                voiced_bytes = 0
                 return
             wav = _pcm16_to_wav(bytes(buf), sample_rate=sample_rate)
             buf.clear()
+            voiced_bytes = 0
             try:
                 files = {"file": ("speech.wav", wav, "audio/wav")}
                 r = await self._client.post(self._url, files=files, data={"language": locale})
@@ -70,14 +80,23 @@ class LocalHttpSTT(STTService):
             except Exception as exc:  # noqa: BLE001
                 log.error("local_stt_error", error=str(exc))
 
+        voiced_bytes = 0
+
         async def consumer() -> None:
-            nonlocal buf, last_chunk_at
+            nonlocal buf, last_chunk_at, voiced_bytes
             try:
                 async for chunk in audio_chunks:
                     if not chunk:
                         continue
-                    buf.extend(chunk)
-                    last_chunk_at = time.monotonic()
+                    rt = get_bot_runtime_payload_sync()
+                    rms_threshold = max(0.001, float(rt.get("stt_voice_rms_threshold", 0.008)))
+                    rms = _pcm_rms(chunk)
+                    if rms >= rms_threshold:
+                        buf.extend(chunk)
+                        voiced_bytes += len(chunk)
+                        last_chunk_at = time.monotonic()
+                    elif buf:
+                        buf.extend(chunk)
                     if len(buf) >= sample_rate * 2 * (self._flush_ms / 1000.0):
                         await flush_buf("size")
             finally:
@@ -119,3 +138,17 @@ def _pcm16_to_wav(pcm: bytes, *, sample_rate: int) -> bytes:
         wav.setframerate(sample_rate)
         wav.writeframes(pcm)
     return out.getvalue()
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    if len(pcm) < 2:
+        return 0.0
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) - (len(pcm) % 2)])
+    if not samples:
+        return 0.0
+    acc = 0.0
+    for s in samples:
+        v = s / 32768.0
+        acc += v * v
+    return (acc / len(samples)) ** 0.5

@@ -88,7 +88,9 @@ class SpeechAnalyticsService:
     async def _transcribe_segments(
         self, audio_bytes: bytes, filename: str
     ) -> tuple[list[_WhisperSegment], str]:
-        file_tuple = (filename or "call.wav", audio_bytes, "application/octet-stream")
+        fname = (filename or "call.wav").strip() or "call.wav"
+        mime = mimetypes.guess_type(fname)[0] or "application/octet-stream"
+        file_tuple = (fname, audio_bytes, mime)
         kwargs: dict = {
             "model": self._stt_model,
             "file": file_tuple,
@@ -99,7 +101,13 @@ class SpeechAnalyticsService:
                 **kwargs,
                 timestamp_granularities=["segment"],
             )
-        except Exception:  # noqa: BLE001 — старые версии SDK без granularities
+        except Exception as exc:  # noqa: BLE001 — старые версии SDK без granularities
+            msg = str(exc)
+            if "Invalid file format" in msg:
+                raise ValueError(
+                    "Неподдерживаемый или повреждённый аудиофайл. "
+                    "Поддерживаются: flac, m4a, mp3, mp4, mpeg, mpga, oga, ogg, wav, webm."
+                ) from exc
             resp = await self._client.audio.transcriptions.create(**kwargs)
 
         if hasattr(resp, "model_dump"):

@@ -5,7 +5,17 @@ from __future__ import annotations
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,12 +34,32 @@ async def list_documents(
         description="Фильтр по пулу: voice | agent_assist; без параметра — все",
     ),
     session: AsyncSession = Depends(get_session),
-) -> list[Document]:
+) -> list[DocumentOut]:
     q = select(Document).order_by(Document.created_at.desc())
     if pool:
         q = q.where(Document.knowledge_pool == pool)
     result = await session.execute(q)
-    return list(result.scalars().all())
+    rows = list(result.scalars().all())
+    if rows:
+        return rows
+
+    # Fallback: если в PostgreSQL пусто, но в Qdrant есть вектора,
+    # восстанавливаем список документов из payload.
+    fallback_pool: KnowledgePoolParam = pool or "voice"
+    indexed = await rag_for_pool(fallback_pool).list_indexed_documents()
+    if not indexed:
+        return []
+    return [
+        DocumentOut(
+            id=item["id"],
+            title=item["title"],
+            locale=item["locale"],
+            knowledge_pool=fallback_pool,
+            chunk_count=item["chunk_count"],
+            created_at=item["created_at"],
+        )
+        for item in indexed
+    ]
 
 
 @router.post("", response_model=DocumentOut, status_code=status.HTTP_201_CREATED)
@@ -70,10 +100,15 @@ async def upload_document(
     return doc
 
 
-@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
 async def delete_document(
     document_id: UUID, session: AsyncSession = Depends(get_session)
-) -> None:
+) -> Response:
     doc = await session.get(Document, document_id)
     if doc is None:
         raise HTTPException(404, "Document not found")
@@ -84,3 +119,4 @@ async def delete_document(
     )
     await rag_for_pool(pool).delete_document(document_id)
     await session.delete(doc)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -176,7 +176,7 @@ export default function VoicesPage() {
                       }
                       spellCheck={false}
                     />
-                    <Button size="sm" variant="secondary" onClick={() => saveTts(v.id)}>
+                    <Button size="sm" variant="outline" onClick={() => saveTts(v.id)}>
                       Сохранить TTS-параметры
                     </Button>
                   </div>

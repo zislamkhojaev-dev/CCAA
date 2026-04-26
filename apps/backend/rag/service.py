@@ -15,6 +15,7 @@ knowledge base. We enforce this in two places:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Literal, Sequence
 
@@ -147,6 +148,48 @@ class RAGService:
                 )
             ),
         )
+
+    async def list_indexed_documents(self) -> list[dict]:
+        """Best-effort document list reconstructed from Qdrant payload.
+
+        Нужен как fallback, когда `documents` в PostgreSQL пусты/потеряны,
+        а вектора в Qdrant уже существуют.
+        """
+        await self.ensure_collection()
+        docs: dict[str, dict] = {}
+        offset = None
+        while True:
+            points, next_offset = await self._client.scroll(
+                collection_name=self._collection,
+                scroll_filter=None,
+                with_payload=True,
+                with_vectors=False,
+                limit=512,
+                offset=offset,
+            )
+            for p in points:
+                payload = p.payload or {}
+                doc_id = str(payload.get("document_id") or "").strip()
+                if not doc_id:
+                    continue
+                row = docs.get(doc_id)
+                if row is None:
+                    title = str(payload.get("title") or "Indexed document")
+                    locale = str(payload.get("locale") or "ru")
+                    row = {
+                        "id": doc_id,
+                        "title": title,
+                        "locale": locale,
+                        "chunk_count": 0,
+                        # В Qdrant нет created_at документа; используем deterministic fallback.
+                        "created_at": datetime.now(timezone.utc),
+                    }
+                    docs[doc_id] = row
+                row["chunk_count"] += 1
+            if next_offset is None:
+                break
+            offset = next_offset
+        return list(docs.values())
 
     @staticmethod
     def format_context(chunks: Sequence[RAGChunk]) -> str:

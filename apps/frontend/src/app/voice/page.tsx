@@ -8,8 +8,9 @@ import { API_BASE } from "@/lib/utils";
 import { backendWsUrl } from "@/lib/ws";
 
 const TARGET_SAMPLE_RATE = 16_000;
-const BARGE_IN_RMS = 0.085;
-const BARGE_IN_COOLDOWN_MS = 400;
+const DEFAULT_BARGE_IN_RMS = 0.12;
+const DEFAULT_BARGE_IN_COOLDOWN_MS = 700;
+const DEFAULT_BARGE_IN_HOLD_FRAMES = 3;
 
 const WORKLET_SRC = `
 class DownsamplerWorklet extends AudioWorkletProcessor {
@@ -46,6 +47,11 @@ registerProcessor("downsampler", DownsamplerWorklet);
 type Status = "idle" | "connecting" | "recording" | "stopping";
 
 type VoiceOpt = { id: string; name: string; is_default: boolean };
+type BotRuntime = {
+  barge_in_rms_threshold?: number;
+  barge_in_cooldown_ms?: number;
+  barge_in_hold_frames?: number;
+};
 
 export default function VoicePage() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -56,7 +62,11 @@ export default function VoicePage() {
   const vadRafRef = useRef<number | null>(null);
   const vadBufRef = useRef<Uint8Array | null>(null);
   const lastBargeRef = useRef(0);
+  const loudFramesRef = useRef(0);
   const botSpeakingRef = useRef(false);
+  const bargeInRmsRef = useRef(DEFAULT_BARGE_IN_RMS);
+  const bargeInCooldownMsRef = useRef(DEFAULT_BARGE_IN_COOLDOWN_MS);
+  const bargeInHoldFramesRef = useRef(DEFAULT_BARGE_IN_HOLD_FRAMES);
 
   const audioQueueRef = useRef<Blob[]>([]);
   const playingRef = useRef(false);
@@ -72,6 +82,7 @@ export default function VoicePage() {
   const [lastEscalation, setLastEscalation] = useState<Record<string, unknown> | null>(null);
   const [voiceOpts, setVoiceOpts] = useState<VoiceOpt[]>([]);
   const [voiceProfileId, setVoiceProfileId] = useState<string>("");
+  const [bargeInHint, setBargeInHint] = useState("");
 
   useEffect(() => () => stop(), []);
 
@@ -84,6 +95,32 @@ export default function VoicePage() {
         setVoiceOpts(list);
         const d = list.find((x) => x.is_default) ?? list[0];
         if (d) setVoiceProfileId((cur) => (cur ? cur : d.id));
+      })
+      .catch(() => {});
+    return () => {
+      cancel = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancel = false;
+    fetch(`${API_BASE}/bot-settings`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((cfg: BotRuntime | null) => {
+        if (cancel || !cfg) return;
+        const rms = Number(cfg.barge_in_rms_threshold ?? DEFAULT_BARGE_IN_RMS);
+        const cd = Number(cfg.barge_in_cooldown_ms ?? DEFAULT_BARGE_IN_COOLDOWN_MS);
+        const hold = Number(cfg.barge_in_hold_frames ?? DEFAULT_BARGE_IN_HOLD_FRAMES);
+        bargeInRmsRef.current = Number.isFinite(rms) ? Math.max(0.01, rms) : DEFAULT_BARGE_IN_RMS;
+        bargeInCooldownMsRef.current = Number.isFinite(cd)
+          ? Math.max(100, Math.round(cd))
+          : DEFAULT_BARGE_IN_COOLDOWN_MS;
+        bargeInHoldFramesRef.current = Number.isFinite(hold)
+          ? Math.max(1, Math.round(hold))
+          : DEFAULT_BARGE_IN_HOLD_FRAMES;
+        setBargeInHint(
+          `barge-in: rms>${bargeInRmsRef.current.toFixed(3)}, cooldown ${bargeInCooldownMsRef.current}ms, hold ${bargeInHoldFramesRef.current}`
+        );
       })
       .catch(() => {});
     return () => {
@@ -148,11 +185,14 @@ export default function VoicePage() {
       }
       const rms = Math.sqrt(sum / buf.length);
       const now = performance.now();
+      if (rms > bargeInRmsRef.current) loudFramesRef.current += 1;
+      else loudFramesRef.current = 0;
       if (
         botSpeakingRef.current &&
-        rms > BARGE_IN_RMS &&
-        now - lastBargeRef.current > BARGE_IN_COOLDOWN_MS
+        loudFramesRef.current >= bargeInHoldFramesRef.current &&
+        now - lastBargeRef.current > bargeInCooldownMsRef.current
       ) {
+        loudFramesRef.current = 0;
         lastBargeRef.current = now;
         ws.send(JSON.stringify({ type: "interrupt" }));
         flushPlayback();
@@ -376,6 +416,7 @@ export default function VoicePage() {
             <Stat label="Отправлено (PCM)" value={`${(bytesSent / 1024).toFixed(1)} KB`} />
             <Stat label="Получено (MP3)" value={`${(bytesRecv / 1024).toFixed(1)} KB`} />
           </div>
+          {bargeInHint && <p className="text-xs text-mutedForeground">{bargeInHint}</p>}
           {error && <Badge tone="danger">Ошибка: {error}</Badge>}
         </CardContent>
       </Card>

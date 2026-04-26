@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,14 +50,20 @@ async def create_criteria_set(
     return row
 
 
-@router.delete("/criteria-sets/{set_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/criteria-sets/{set_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
 async def delete_criteria_set(
     set_id: UUID, session: AsyncSession = Depends(get_session)
-) -> None:
+) -> Response:
     row = await session.get(AnalyticsCriteriaSet, set_id)
     if row is None:
         raise HTTPException(404, "Criteria set not found")
     await session.delete(row)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ---------- Criteria ----------
@@ -98,14 +104,20 @@ async def add_criterion(
     return row
 
 
-@router.delete("/criteria/{criterion_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/criteria/{criterion_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
 async def delete_criterion(
     criterion_id: UUID, session: AsyncSession = Depends(get_session)
-) -> None:
+) -> Response:
     row = await session.get(AnalyticsCriterion, criterion_id)
     if row is None:
         raise HTTPException(404, "Criterion not found")
     await session.delete(row)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 # ---------- Analyze ----------
@@ -120,10 +132,13 @@ async def analyze_recording(
     if not raw:
         raise HTTPException(400, "Empty file")
     svc = SpeechAnalyticsService()
-    return await svc.analyze_recording(
-        audio_bytes=raw,
-        filename=file.filename or "recording.wav",
-        session=session,
-        criteria_set_id=criteria_set_id,
-        locale=locale,
-    )
+    try:
+        return await svc.analyze_recording(
+            audio_bytes=raw,
+            filename=file.filename or "recording.wav",
+            session=session,
+            criteria_set_id=criteria_set_id,
+            locale=locale,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc

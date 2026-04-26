@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import AsyncIterator
 
@@ -41,6 +43,9 @@ class VoiceEngine:
         self._active_turn: asyncio.Task | None = None
         self._recorder = conversation_recorder
         self._on_escalation = on_escalation
+        self._last_accepted_utterance = ""
+        self._last_accepted_at = 0.0
+        self._last_fallback_at = 0.0
 
     def _default_voice_id(self) -> str:
         provider = self._settings.tts_provider
@@ -81,8 +86,21 @@ class VoiceEngine:
                     audio_in, locale=locale, sample_rate=sample_rate
                 ):
                     if event.is_final and event.text.strip():
-                        log.info("stt_final", text=event.text, conf=event.confidence)
-                        await utterance_queue.put(event.text)
+                        text = event.text.strip()
+                        if not _is_meaningful_utterance(text):
+                            log.info("stt_ignored_noise", text=text)
+                            continue
+                        now = time.monotonic()
+                        if (
+                            text == self._last_accepted_utterance
+                            and now - self._last_accepted_at < 1.5
+                        ):
+                            log.info("stt_ignored_duplicate", text=text)
+                            continue
+                        self._last_accepted_utterance = text
+                        self._last_accepted_at = now
+                        log.info("stt_final", text=text, conf=event.confidence)
+                        await utterance_queue.put(text)
             finally:
                 await utterance_queue.put(None)
 
@@ -147,16 +165,21 @@ class VoiceEngine:
                 return
 
             if not sources:
+                now = time.monotonic()
+                if now - self._last_fallback_at < 2.0:
+                    log.info("fallback_skipped_cooldown", text=text)
+                    return
+                self._last_fallback_at = now
                 fb = fallback_message(locale)
                 if self._recorder:
                     await self._recorder.add_turn("assistant", fb, extra={"fallback": True})
-                async for chunk in self._tts.stream_synthesize(
+                packet = await self._collect_tts_packet(
                     _once(fb),
                     voice_id=voice_id,
                     locale=locale,
-                    voice_tts_params=self._voice_tts_params,
-                ):
-                    await audio_out.put(chunk)
+                )
+                if packet:
+                    await audio_out.put(packet)
                 self._history.append(ChatMessage(role="user", content=text))
                 self._history.append(ChatMessage(role="assistant", content=fb))
                 self._trim_history()
@@ -193,13 +216,13 @@ class VoiceEngine:
 
                 async def tts_consumer() -> None:
                     with timed_stage("tts"):
-                        async for chunk in self._tts.stream_synthesize(
+                        packet = await self._collect_tts_packet(
                             text_iter(),
                             voice_id=voice_id,
                             locale=locale,
-                            voice_tts_params=self._voice_tts_params,
-                        ):
-                            await audio_out.put(chunk)
+                        )
+                        if packet:
+                            await audio_out.put(packet)
 
                 await asyncio.gather(llm_producer(), tts_consumer())
 
@@ -234,13 +257,13 @@ class VoiceEngine:
                     locale=locale, reason=reason
                 )
                 await self._on_escalation(pkg)
-        async for chunk in self._tts.stream_synthesize(
+        packet = await self._collect_tts_packet(
             _once(assistant_text),
             voice_id=voice_id,
             locale=locale,
-            voice_tts_params=self._voice_tts_params,
-        ):
-            await audio_out.put(chunk)
+        )
+        if packet:
+            await audio_out.put(packet)
         self._history.append(ChatMessage(role="user", content=text))
         self._history.append(ChatMessage(role="assistant", content=assistant_text))
         self._trim_history()
@@ -249,3 +272,40 @@ class VoiceEngine:
         rt = get_bot_runtime_payload_sync()
         n = max(2, int(rt.get("history_max_messages", 24)))
         self._history = self._history[-n:]
+
+    async def _collect_tts_packet(
+        self,
+        text_chunks: AsyncIterator[str],
+        *,
+        voice_id: str,
+        locale: str,
+    ) -> bytes:
+        """Aggregate TTS bytes into one websocket payload.
+
+        Frontend currently treats each websocket binary message as a standalone
+        audio blob, so sending partial codec chunks causes choppy playback.
+        """
+        out = bytearray()
+        async for chunk in self._tts.stream_synthesize(
+            text_chunks,
+            voice_id=voice_id,
+            locale=locale,
+            voice_tts_params=self._voice_tts_params,
+        ):
+            if chunk:
+                out.extend(chunk)
+        return bytes(out)
+
+
+_ONLY_PUNCT_OR_EMOJI_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+
+
+def _is_meaningful_utterance(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 2:
+        return False
+    # Ignore pure emoji / punctuation / symbols.
+    if _ONLY_PUNCT_OR_EMOJI_RE.fullmatch(t):
+        return False
+    # Need at least one alnum character to avoid noisy transcripts.
+    return any(ch.isalnum() for ch in t)

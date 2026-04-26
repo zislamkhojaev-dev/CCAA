@@ -25,8 +25,12 @@ export default function KnowledgePage() {
 
   const load = useCallback(async () => {
     try {
+      setError(null);
       const r = await fetch(`${API_BASE}/documents?pool=${pool}`);
-      if (r.ok) setDocs(await r.json());
+      if (!r.ok) {
+        throw new Error(await r.text());
+      }
+      setDocs(await r.json());
     } catch (e) {
       setError(String(e));
     }
@@ -60,7 +64,12 @@ export default function KnowledgePage() {
 
   async function onDelete(id: string) {
     if (!confirm("Удалить документ из выбранного пула?")) return;
-    await fetch(`${API_BASE}/documents/${id}`, { method: "DELETE" });
+    setError(null);
+    const r = await fetch(`${API_BASE}/documents/${id}`, { method: "DELETE" });
+    if (!r.ok) {
+      setError(await r.text());
+      return;
+    }
     await load();
   }
 

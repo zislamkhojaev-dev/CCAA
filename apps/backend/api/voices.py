@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,11 +45,17 @@ async def patch_voice_tts(
     return voice
 
 
-@router.delete("/{voice_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{voice_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
 async def delete_voice(
     voice_id: UUID, session: AsyncSession = Depends(get_session)
-) -> None:
+) -> Response:
     voice = await session.get(Voice, voice_id)
     if voice is None:
         raise HTTPException(404, "Voice not found")
     await session.delete(voice)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

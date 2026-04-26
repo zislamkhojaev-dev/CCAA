@@ -89,10 +89,13 @@ export default function PlaygroundPage() {
       pending = frames.pop() ?? "";
       for (const frame of frames) {
         const evMatch = frame.match(/^event:\s*(\S+)/m);
-        const dataMatch = frame.match(/^data:\s*(.*)$/ms);
+        const dataMatch = frame.match(/^data:(.*)$/ms);
         if (!evMatch || !dataMatch) continue;
         const event = evMatch[1];
-        const raw = dataMatch[1];
+        let raw = dataMatch[1] ?? "";
+        // SSE allows exactly one optional leading space after "data:".
+        // Preserve token spacing from the model, remove only that prefix.
+        if (raw.startsWith(" ")) raw = raw.slice(1);
         if (event === "meta") {
           try {
             setMeta(JSON.parse(raw));

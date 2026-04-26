@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -44,11 +44,17 @@ async def update_prompt(
     return prompt
 
 
-@router.delete("/{prompt_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{prompt_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    response_model=None,
+)
 async def delete_prompt(
     prompt_id: UUID, session: AsyncSession = Depends(get_session)
-) -> None:
+) -> Response:
     prompt = await session.get(Prompt, prompt_id)
     if prompt is None:
         raise HTTPException(404, "Prompt not found")
     await session.delete(prompt)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)

@@ -52,14 +52,21 @@ export default function AnalyticsPage() {
     max_score: 10,
     rubric: "",
   });
+  const [newSet, setNewSet] = useState({
+    name: "",
+    locale: "ru" as "ru" | "uz",
+    is_default: false,
+  });
 
-  async function loadSets() {
+  async function loadSets(): Promise<SetRow[]> {
     const r = await fetch(`${API_BASE}/analytics/criteria-sets`);
     if (r.ok) {
       const data = await r.json();
       setSets(data);
       if (data.length && !selectedSet) setSelectedSet(data[0].id);
+      return data;
     }
+    return [];
   }
 
   async function loadCriteria(setId: string) {
@@ -119,6 +126,89 @@ export default function AnalyticsPage() {
     await loadCriteria(selectedSet);
   }
 
+  async function createSet() {
+    if (!newSet.name.trim()) return;
+    setError(null);
+    const r = await fetch(`${API_BASE}/analytics/criteria-sets`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: newSet.name.trim(),
+        locale: newSet.locale,
+        is_default: newSet.is_default,
+      }),
+    });
+    if (!r.ok) {
+      setError(await r.text());
+      return;
+    }
+    const created = await r.json();
+    setNewSet({ name: "", locale: "ru", is_default: false });
+    await loadSets();
+    setSelectedSet(created.id);
+  }
+
+  async function deleteSelectedSet() {
+    if (!selectedSet) return;
+    const current = sets.find((s) => s.id === selectedSet);
+    if (!current) return;
+    if (!confirm(`Удалить шаблон "${current.name}" со всеми критериями?`)) return;
+    setError(null);
+    const r = await fetch(`${API_BASE}/analytics/criteria-sets/${selectedSet}`, {
+      method: "DELETE",
+    });
+    if (!r.ok) {
+      setError(await r.text());
+      return;
+    }
+    const prev = selectedSet;
+    const refreshed = await loadSets();
+    const next = refreshed.find((s) => s.id !== prev)?.id ?? null;
+    setSelectedSet(next);
+    setCriteria([]);
+  }
+
+  async function cloneSelectedSet() {
+    if (!selectedSet) return;
+    const currentSet = sets.find((s) => s.id === selectedSet);
+    if (!currentSet) return;
+    setError(null);
+    const createResp = await fetch(`${API_BASE}/analytics/criteria-sets`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        name: `${currentSet.name} (копия)`,
+        locale: currentSet.locale,
+        is_default: false,
+      }),
+    });
+    if (!createResp.ok) {
+      setError(await createResp.text());
+      return;
+    }
+    const cloneSet = await createResp.json();
+    for (const c of criteria) {
+      const r = await fetch(`${API_BASE}/analytics/criteria-sets/${cloneSet.id}/criteria`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          code: c.code,
+          title: c.title,
+          description: c.description,
+          weight: c.weight,
+          max_score: c.max_score,
+          rubric: c.rubric,
+        }),
+      });
+      if (!r.ok) {
+        setError(`Шаблон создан, но копирование критерия "${c.code}" не удалось: ${await r.text()}`);
+        break;
+      }
+    }
+    await loadSets();
+    setSelectedSet(cloneSet.id);
+  }
+
   async function deleteCriterion(id: string) {
     await fetch(`${API_BASE}/analytics/criteria/${id}`, { method: "DELETE" });
     if (selectedSet) await loadCriteria(selectedSet);
@@ -138,9 +228,11 @@ export default function AnalyticsPage() {
       <Card>
         <CardHeader>
           <CardTitle>Набор критериев</CardTitle>
-          <CardDescription>Выберите набор, который будет передан в LLM-оценщик.</CardDescription>
+          <CardDescription>
+            Шаблон = набор критериев для оценки звонка. Выберите активный шаблон или создайте новый.
+          </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-2">
+        <CardContent className="space-y-4">
           <select
             className="w-full max-w-md rounded-md border border-border bg-background px-3 py-2 text-sm"
             value={selectedSet ?? ""}
@@ -158,6 +250,51 @@ export default function AnalyticsPage() {
               Нет наборов — выполните <code className="bg-muted px-1">python -m apps.backend.scripts.seed</code>
             </p>
           )}
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" size="sm" onClick={cloneSelectedSet} disabled={!selectedSet}>
+              Клонировать шаблон
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={deleteSelectedSet}
+              disabled={!selectedSet || sets.length <= 1}
+            >
+              Удалить шаблон
+            </Button>
+          </div>
+          <div className="rounded-md border border-border p-3 space-y-2 max-w-3xl">
+            <p className="text-sm font-medium">Создать новый шаблон</p>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <input
+                className="rounded-md border border-border px-3 py-2 text-sm sm:col-span-2"
+                placeholder="Название шаблона (например, QA входящая линия)"
+                value={newSet.name}
+                onChange={(e) => setNewSet((v) => ({ ...v, name: e.target.value }))}
+              />
+              <select
+                className="rounded-md border border-border bg-background px-3 py-2 text-sm"
+                value={newSet.locale}
+                onChange={(e) => setNewSet((v) => ({ ...v, locale: e.target.value as "ru" | "uz" }))}
+              >
+                <option value="ru">ru</option>
+                <option value="uz">uz</option>
+              </select>
+            </div>
+            <label className="inline-flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={newSet.is_default}
+                onChange={(e) => setNewSet((v) => ({ ...v, is_default: e.target.checked }))}
+              />
+              Сделать шаблоном по умолчанию
+            </label>
+            <div>
+              <Button size="sm" onClick={createSet} disabled={!newSet.name.trim()}>
+                Создать шаблон
+              </Button>
+            </div>
+          </div>
         </CardContent>
       </Card>
 
@@ -169,6 +306,33 @@ export default function AnalyticsPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          <div className="rounded-md border border-border bg-muted/40 p-3 text-xs text-mutedForeground space-y-1">
+            <p>
+              <strong>Как настраивать поля:</strong>
+            </p>
+            <p>
+              <strong>code</strong> — короткий уникальный ID критерия (латиница/цифры), например
+              <code className="mx-1 bg-muted px-1 rounded">greeting</code>,
+              <code className="mx-1 bg-muted px-1 rounded">compliance</code>.
+            </p>
+            <p>
+              <strong>title</strong> — как критерий будет называться в отчёте.
+            </p>
+            <p>
+              <strong>description</strong> — кратко, что именно проверяем (для команды/читабельности).
+            </p>
+            <p>
+              <strong>weight</strong> — важность критерия в итоге. Обычно 0.5-3.0 (чем больше, тем
+              сильнее влияет на общий балл).
+            </p>
+            <p>
+              <strong>max_score</strong> — верхняя граница оценки по критерию (обычно 5 или 10).
+            </p>
+            <p>
+              <strong>rubric</strong> — инструкция для LLM, как ставить балл (что такое 0, средний и
+              максимум + примеры).
+            </p>
+          </div>
           <ul className="space-y-2 text-sm">
             {criteria.map((c) => (
               <li
@@ -191,18 +355,36 @@ export default function AnalyticsPage() {
             ))}
           </ul>
           <div className="grid gap-2 sm:grid-cols-2 max-w-3xl">
+            <label className="space-y-1">
+              <span className="text-xs text-mutedForeground">code (уникальный ID)</span>
             <input
               className="rounded-md border border-border px-3 py-2 text-sm"
-              placeholder="code (латиница)"
+              placeholder="Например: compliance"
               value={newCrit.code}
               onChange={(e) => setNewCrit({ ...newCrit, code: e.target.value })}
             />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs text-mutedForeground">Название критерия</span>
             <input
               className="rounded-md border border-border px-3 py-2 text-sm"
-              placeholder="Название"
+              placeholder="Например: Соблюдение регламентов"
               value={newCrit.title}
               onChange={(e) => setNewCrit({ ...newCrit, title: e.target.value })}
             />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs text-mutedForeground">Описание (что проверяем)</span>
+              <Textarea
+                placeholder="Кратко: какие сигналы в речи считаем хорошими/плохими."
+                rows={2}
+                value={newCrit.description}
+                onChange={(e) => setNewCrit({ ...newCrit, description: e.target.value })}
+              />
+            </label>
+            <div />
+            <label className="space-y-1">
+              <span className="text-xs text-mutedForeground">Вес (важность, обычно 0.5-3)</span>
             <input
               type="number"
               className="rounded-md border border-border px-3 py-2 text-sm"
@@ -210,6 +392,9 @@ export default function AnalyticsPage() {
               value={newCrit.weight}
               onChange={(e) => setNewCrit({ ...newCrit, weight: Number(e.target.value) })}
             />
+            </label>
+            <label className="space-y-1">
+              <span className="text-xs text-mutedForeground">Макс. балл (обычно 5 или 10)</span>
             <input
               type="number"
               className="rounded-md border border-border px-3 py-2 text-sm"
@@ -217,10 +402,14 @@ export default function AnalyticsPage() {
               value={newCrit.max_score}
               onChange={(e) => setNewCrit({ ...newCrit, max_score: Number(e.target.value) })}
             />
+            </label>
             <div className="sm:col-span-2">
+              <p className="text-xs text-mutedForeground mb-1">
+                Rubric (как LLM должен оценивать критерий)
+              </p>
               <Textarea
-                placeholder="Рубрика для LLM (как оценивать)"
-                rows={2}
+                placeholder="Пример: 0 — нет приветствия; 5 — есть формальное приветствие; 10 — приветствие + имя + вежливое уточнение запроса."
+                rows={3}
                 value={newCrit.rubric}
                 onChange={(e) => setNewCrit({ ...newCrit, rubric: e.target.value })}
               />

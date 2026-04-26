@@ -227,7 +227,7 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 
 ## Диаризация в аналитике: Deepgram и pyannote
 
-- `**DIARIZATION_PROVIDER=deepgram**` — в сервис аналитики передаётся сырой файл записи; бэкенд вызывает `**POST https://api.deepgram.com/v1/listen**` с `diarize=true`, `utterances=true`, парсит `results.utterances` и мапит в `DiarizedTurn`. Нужен `**DEEPGRAM_API_KEY**`. Эвристика спикеров: **0 → agent**, **1 → customer** (типичный порядок в моно-звонке); при одном спикере — роль `unknown`.
+- `**DIARIZATION_PROVIDER=deepgram`** — в сервис аналитики передаётся сырой файл записи; бэкенд вызывает `**POST https://api.deepgram.com/v1/listen`** с `diarize=true`, `utterances=true`, парсит `results.utterances` и мапит в `DiarizedTurn`. Нужен `**DEEPGRAM_API_KEY`**. Эвристика спикеров: **0 → agent**, **1 → customer** (типичный порядок в моно-звонке); при одном спикере — роль `unknown`.
 - `**DIARIZATION_PROVIDER=pyannote`** — тяжёлая модель **не** встроена в образ API. Ожидается отдельный сервис по адресу `**PYANNOTE_WORKER_URL`**: POST `multipart/form-data`, поле `**file`** — то же аудио, что загрузил пользователь. Ответ **JSON**:
 
 ```json

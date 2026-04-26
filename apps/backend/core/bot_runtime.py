@@ -20,6 +20,12 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "openai_tts_speed": 1.0,
     "elevenlabs_stability": 0.5,
     "elevenlabs_similarity_boost": 0.75,
+    "barge_in_rms_threshold": 0.12,
+    "barge_in_cooldown_ms": 700,
+    "barge_in_hold_frames": 3,
+    "stt_voice_rms_threshold": 0.008,
+    "stt_min_voiced_seconds": 0.2,
+    "stt_duplicate_cooldown_sec": 4.0,
 }
 
 _sync_merged: dict[str, Any] = copy.deepcopy(DEFAULT_PAYLOAD)

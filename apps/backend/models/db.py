@@ -70,7 +70,12 @@ async def get_session() -> AsyncIterator[AsyncSession]:
     get_engine()
     assert _session_factory is not None
     async with _session_factory() as session:
-        yield session
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
 
 async def init_db() -> None:
