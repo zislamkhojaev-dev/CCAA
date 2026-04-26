@@ -1,0 +1,170 @@
+"""WebSocket: голосовой канал + запись транскрипта + эскалация."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import AsyncIterator
+from uuid import UUID
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy import select
+
+from apps.backend.config import get_settings
+from apps.backend.core import get_orchestrator
+from apps.backend.core.conversation_recorder import ConversationRecorder, create_conversation
+from apps.backend.core.voice_engine import VoiceEngine
+from apps.backend.models.db import session_scope
+from apps.backend.models.entities import Voice
+from apps.backend.utils.logging import get_logger
+
+router = APIRouter()
+log = get_logger(__name__)
+
+
+@router.websocket("/ws/voice")
+async def voice_ws(ws: WebSocket) -> None:
+    await ws.accept()
+    locale = ws.query_params.get("locale", "ru")
+    voice_id = ws.query_params.get("voice_id")
+    sample_rate = int(ws.query_params.get("sample_rate", "16000"))
+
+    conv_id = await create_conversation(channel="voice_ws", locale=locale)
+    recorder = ConversationRecorder(conv_id)
+
+    audio_in_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+    audio_out_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+
+    async def emit_escalation(pkg: dict) -> None:
+        try:
+            await ws.send_json({"type": "escalation_packet", **pkg})
+        except (RuntimeError, WebSocketDisconnect):
+            pass
+
+    effective_voice_id: str | None = None
+    voice_tts: dict = {}
+    async with session_scope() as s:
+        vrow = None
+        if voice_id:
+            try:
+                vrow = await s.get(Voice, UUID(voice_id))
+            except ValueError:
+                vrow = None
+        if vrow is None:
+            r = await s.execute(select(Voice).where(Voice.is_default.is_(True)).limit(1))
+            vrow = r.scalar_one_or_none()
+        if vrow is not None:
+            effective_voice_id = vrow.provider_voice_id
+            voice_tts = dict(vrow.tts_params or {})
+    if not effective_voice_id:
+        st = get_settings()
+        if st.tts_provider == "elevenlabs":
+            effective_voice_id = st.elevenlabs_voice_id
+        elif st.tts_provider == "openai":
+            effective_voice_id = st.openai_tts_voice
+        else:
+            effective_voice_id = voice_id or "default"
+
+    engine = VoiceEngine(
+        get_orchestrator(),
+        conversation_recorder=recorder,
+        on_escalation=emit_escalation,
+        voice_tts_params=voice_tts,
+    )
+
+    async def reader() -> None:
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    break
+                data = msg.get("bytes")
+                if data:
+                    await audio_in_q.put(data)
+                    continue
+                text = msg.get("text")
+                if text:
+                    try:
+                        ctrl = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+                    t = ctrl.get("type")
+                    if t == "end":
+                        break
+                    if t == "interrupt":
+                        await engine.interrupt()
+                        try:
+                            await ws.send_json({"type": "interrupted"})
+                        except (RuntimeError, WebSocketDisconnect):
+                            pass
+                        continue
+                    if t == "escalate":
+                        await engine.interrupt()
+                        reason = str(ctrl.get("reason") or "manual")
+                        await recorder.mark_escalated(reason)
+                        pkg = await recorder.build_escalation_packet(
+                            locale=locale, reason=reason
+                        )
+                        await emit_escalation(pkg)
+                        continue
+        finally:
+            await audio_in_q.put(None)
+
+    async def writer() -> None:
+        while True:
+            chunk = await audio_out_q.get()
+            if chunk is None:
+                break
+            try:
+                await ws.send_bytes(chunk)
+            except (RuntimeError, WebSocketDisconnect):
+                break
+
+    async def audio_in_iter() -> AsyncIterator[bytes]:
+        while True:
+            chunk = await audio_in_q.get()
+            if chunk is None:
+                return
+            yield chunk
+
+    try:
+        await ws.send_json({"type": "session", "conversation_id": str(conv_id)})
+    except (RuntimeError, WebSocketDisconnect):
+        pass
+
+    reader_task = asyncio.create_task(reader(), name="ws-reader")
+    writer_task = asyncio.create_task(writer(), name="ws-writer")
+    engine_task = asyncio.create_task(
+        engine.run(
+            audio_in=audio_in_iter(),
+            audio_out=audio_out_q,
+            locale=locale,
+            voice_id=effective_voice_id,
+            sample_rate=sample_rate,
+        ),
+        name="ws-engine",
+    )
+
+    try:
+        await asyncio.wait(
+            {reader_task, writer_task, engine_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except WebSocketDisconnect:
+        log.info("voice_ws_client_disconnected")
+    finally:
+        for task in (reader_task, writer_task, engine_task):
+            task.cancel()
+        for task in (reader_task, writer_task, engine_task):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        try:
+            await recorder.mark_completed()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("conversation_finalize_failed", error=str(exc))
+        try:
+            await ws.close()
+        except RuntimeError:
+            pass
