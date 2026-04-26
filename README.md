@@ -18,7 +18,7 @@
 | БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                             |
 | STT        | Deepgram (WebSocket), OpenAI Whisper, `**local_http`**, моки                                  |
 | LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `**local_http`** (Ollama / vLLM / LM Studio) |
-| TTS        | ElevenLabs, OpenAI `tts-1`, `**local_http**`, моки                                            |
+| TTS        | ElevenLabs, OpenAI `tts-1`, `**local_http`**, моки                                            |
 | Контейнеры | Docker, Docker Compose                                                                        |
 
 
@@ -223,7 +223,7 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 
 **Профиль голоса:** в таблице `voices` есть колонка `**tts_params`** (JSONB). В админке «Голоса» — поле под каждым профилем; API: `**PATCH /api/v1/voices/{id}`** с телом `{"tts_params":{...}}`. Переопределения: например `{"speed":1.1}` для OpenAI, `{"stability":0.4,"similarity_boost":0.8}` для ElevenLabs.
 
-После миграции `**0005_bot_runtime_voice_tts**` выполните `alembic upgrade head`.
+После миграции `**0005_bot_runtime_voice_tts`** выполните `alembic upgrade head`.
 
 ## Диаризация в аналитике: Deepgram и pyannote
 
