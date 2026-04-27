@@ -68,9 +68,10 @@ export default function VoicePage() {
   const bargeInCooldownMsRef = useRef(DEFAULT_BARGE_IN_COOLDOWN_MS);
   const bargeInHoldFramesRef = useRef(DEFAULT_BARGE_IN_HOLD_FRAMES);
 
-  const audioQueueRef = useRef<Blob[]>([]);
+  const audioQueueRef = useRef<Array<{ blob: Blob; segmentIndex: number | null }>>([]);
   const playingRef = useRef(false);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
+  const incomingSegmentRef = useRef<number | null>(null);
 
   const [status, setStatus] = useState<Status>("idle");
   const [locale, setLocale] = useState<"ru" | "uz">("ru");
@@ -83,6 +84,8 @@ export default function VoicePage() {
   const [voiceOpts, setVoiceOpts] = useState<VoiceOpt[]>([]);
   const [voiceProfileId, setVoiceProfileId] = useState<string>("");
   const [bargeInHint, setBargeInHint] = useState("");
+  const [callState, setCallState] = useState<string>("listening");
+  const [segmentCount, setSegmentCount] = useState(0);
 
   useEffect(() => () => stop(), []);
 
@@ -142,11 +145,12 @@ export default function VoicePage() {
 
   function playNext() {
     if (playingRef.current) return;
-    const blob = audioQueueRef.current.shift();
-    if (!blob) {
+    const item = audioQueueRef.current.shift();
+    if (!item) {
       botSpeakingRef.current = false;
       return;
     }
+    const { blob, segmentIndex } = item;
     playingRef.current = true;
     botSpeakingRef.current = true;
     const url = URL.createObjectURL(blob);
@@ -154,6 +158,10 @@ export default function VoicePage() {
     audioElRef.current = audio;
     audio.src = url;
     audio.onended = () => {
+      const ws = wsRef.current;
+      if (segmentIndex != null && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "audio_played_ack", index: segmentIndex }));
+      }
       URL.revokeObjectURL(url);
       playingRef.current = false;
       playNext();
@@ -243,12 +251,25 @@ export default function VoicePage() {
         if (typeof ev.data === "string") {
           try {
             const j = JSON.parse(ev.data as string);
-            if (j.type === "interrupted") flushPlayback();
-            if (j.type === "session" && j.conversation_id)
-              setConversationId(String(j.conversation_id));
-            if (j.type === "escalation_packet") {
+            const evtType = String(j.event || j.type || "");
+            const evtData =
+              j && typeof j.data === "object" && j.data !== null
+                ? (j.data as Record<string, unknown>)
+                : (j as Record<string, unknown>);
+            if (evtType === "interrupted") flushPlayback();
+            if (evtType === "state" && evtData.state) setCallState(String(evtData.state));
+            if (evtType === "audio_segment_start") {
+              setSegmentCount((n) => n + 1);
+              incomingSegmentRef.current = Number(evtData.index ?? -1);
+            }
+            if (evtType === "audio_segment_end") {
+              incomingSegmentRef.current = null;
+            }
+            if (evtType === "session" && evtData.conversation_id)
+              setConversationId(String(evtData.conversation_id));
+            if (evtType === "escalation_packet") {
               flushPlayback();
-              setLastEscalation(j as Record<string, unknown>);
+              setLastEscalation(evtData);
             }
           } catch {
             /* ignore */
@@ -257,7 +278,7 @@ export default function VoicePage() {
         }
         const blob = new Blob([ev.data], { type: "audio/mpeg" });
         setBytesRecv((n) => n + blob.size);
-        audioQueueRef.current.push(blob);
+        audioQueueRef.current.push({ blob, segmentIndex: incomingSegmentRef.current });
         playNext();
       };
       ws.onerror = () => setError("WebSocket error");
@@ -335,8 +356,9 @@ export default function VoicePage() {
         <h2 className="text-3xl font-semibold">Голосовой плейграунд</h2>
         <p className="text-mutedForeground mt-1">
           Непрерывный разговор: микрофон всегда в эфире, ответ бота можно{" "}
-          <strong>перебить</strong> — начните говорить во время воспроизведения (VAD на клиенте +
-          <code className="mx-1 bg-muted px-1 rounded">interrupt</code> на сервере).
+          <strong>перебить</strong> — во время воспроизведения клиент по громкости (RMS) шлёт{" "}
+          <code className="mx-1 bg-muted px-1 rounded">interrupt</code>, на сервере перед STT
+          отдельно включён VAD (Silero ONNX или WebRTC по настройке бэкенда).
         </p>
       </header>
 
@@ -344,8 +366,8 @@ export default function VoicePage() {
         <CardHeader>
           <CardTitle>Управление</CardTitle>
           <CardDescription>
-            Режим имитирует линию: STT непрерывно слушает, новая финальная фраза отменяет текущий
-            ответ бота.
+            Режим имитирует линию: аудио на сервере проходит VAD, затем STT; новая финальная фраза
+            отменяет текущий ответ бота.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -385,6 +407,8 @@ export default function VoicePage() {
             <Badge tone={status === "recording" ? "success" : "default"}>
               {status === "recording" ? "В эфире" : "Не активно"}
             </Badge>
+            {status === "recording" && <Badge>State: {callState}</Badge>}
+            {segmentCount > 0 && <Badge>Сегментов: {segmentCount}</Badge>}
             {bargeInCount > 0 && <Badge tone="warning">Перебиваний: {bargeInCount}</Badge>}
             <Button
               variant="outline"

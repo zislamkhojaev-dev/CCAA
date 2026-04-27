@@ -7,6 +7,9 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 
+const ANALYTICS_DIRECT_URL =
+  process.env.NEXT_PUBLIC_ANALYTICS_DIRECT_URL ?? "http://localhost:8000/api/v1/analytics/analyze";
+
 type Criterion = {
   id: string;
   set_id: string;
@@ -93,7 +96,9 @@ export default function AnalyticsPage() {
       fd.append("file", file);
       fd.append("criteria_set_id", selectedSet);
       fd.append("locale", "ru");
-      const r = await fetch(`${API_BASE}/analytics/analyze`, { method: "POST", body: fd });
+      // Анализ аудио лучше слать напрямую в backend:
+      // через Next rewrite для крупных multipart иногда рвётся сокет (ECONNRESET).
+      const r = await fetch(ANALYTICS_DIRECT_URL, { method: "POST", body: fd });
       if (!r.ok) throw new Error(await r.text());
       setResult(await r.json());
     } catch (err: unknown) {
