@@ -49,5 +49,6 @@ async def get_conversation(
         created_at=conv.created_at,
         updated_at=conv.updated_at,
         ended_at=conv.ended_at,
+        case_state=dict((conv.meta or {}).get("case_state") or {}),
         turns=turns,
     )

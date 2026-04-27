@@ -33,13 +33,21 @@ async def voice_ws(ws: WebSocket) -> None:
     recorder = ConversationRecorder(conv_id)
 
     audio_in_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
-    audio_out_q: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=256)
+    audio_out_q: asyncio.Queue[bytes | dict | None] = asyncio.Queue(maxsize=256)
 
-    async def emit_escalation(pkg: dict) -> None:
+    async def send_event(name: str, payload: dict | None = None) -> None:
+        data = payload or {}
+        body = {"type": name, **data, "v": 1, "event": name, "data": data}
         try:
-            await ws.send_json({"type": "escalation_packet", **pkg})
+            await ws.send_json(body)
         except (RuntimeError, WebSocketDisconnect):
             pass
+
+    async def emit_escalation(pkg: dict) -> None:
+        await send_event("escalation_packet", pkg)
+
+    async def emit_state(state_evt: dict) -> None:
+        await send_event("state", state_evt)
 
     effective_voice_id: str | None = None
     voice_tts: dict = {}
@@ -69,6 +77,7 @@ async def voice_ws(ws: WebSocket) -> None:
         get_orchestrator(),
         conversation_recorder=recorder,
         on_escalation=emit_escalation,
+        on_state_change=emit_state,
         voice_tts_params=voice_tts,
     )
 
@@ -93,10 +102,7 @@ async def voice_ws(ws: WebSocket) -> None:
                         break
                     if t == "interrupt":
                         await engine.interrupt()
-                        try:
-                            await ws.send_json({"type": "interrupted"})
-                        except (RuntimeError, WebSocketDisconnect):
-                            pass
+                        await send_event("interrupted")
                         continue
                     if t == "escalate":
                         await engine.interrupt()
@@ -107,6 +113,13 @@ async def voice_ws(ws: WebSocket) -> None:
                         )
                         await emit_escalation(pkg)
                         continue
+                    if t == "audio_played_ack":
+                        try:
+                            idx = int(ctrl.get("index"))
+                        except Exception:  # noqa: BLE001
+                            continue
+                        await engine.mark_audio_played(idx)
+                        continue
         finally:
             await audio_in_q.put(None)
 
@@ -115,6 +128,15 @@ async def voice_ws(ws: WebSocket) -> None:
             chunk = await audio_out_q.get()
             if chunk is None:
                 break
+            if isinstance(chunk, dict):
+                if "type" in chunk:
+                    name = str(chunk.get("type") or "event")
+                    payload = dict(chunk)
+                    payload.pop("type", None)
+                    await send_event(name, payload)
+                else:
+                    await send_event("event", dict(chunk))
+                continue
             try:
                 await ws.send_bytes(chunk)
             except (RuntimeError, WebSocketDisconnect):
@@ -128,8 +150,8 @@ async def voice_ws(ws: WebSocket) -> None:
             yield chunk
 
     try:
-        await ws.send_json({"type": "session", "conversation_id": str(conv_id)})
-    except (RuntimeError, WebSocketDisconnect):
+        await send_event("session", {"conversation_id": str(conv_id)})
+    except Exception:  # noqa: BLE001
         pass
 
     reader_task = asyncio.create_task(reader(), name="ws-reader")

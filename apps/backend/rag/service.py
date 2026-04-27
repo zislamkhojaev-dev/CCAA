@@ -14,7 +14,10 @@ knowledge base. We enforce this in two places:
 
 from __future__ import annotations
 
+import math
+import re
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Literal, Sequence
@@ -23,6 +26,7 @@ from qdrant_client import AsyncQdrantClient
 from qdrant_client.http import models as qm
 
 from apps.backend.config import get_settings
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.models.schemas import RAGChunk
 from apps.backend.rag.chunking import chunk_text
 from apps.backend.services import get_llm
@@ -108,6 +112,7 @@ class RAGService:
         await self.ensure_collection()
         if not query.strip():
             return []
+        rt = get_bot_runtime_payload_sync()
         [vector] = await self._llm.embed([query])
 
         flt: qm.Filter | None = None
@@ -116,14 +121,15 @@ class RAGService:
                 must=[qm.FieldCondition(key="locale", match=qm.MatchValue(value=locale))]
             )
 
+        candidate_pool = max(top_k, int(rt.get("rag_candidate_pool_size", 20)))
         hits = await self._client.search(
             collection_name=self._collection,
             query_vector=vector,
-            limit=top_k,
+            limit=max(top_k * 2, candidate_pool),
             score_threshold=score_threshold,
             query_filter=flt,
         )
-        return [
+        candidates = [
             RAGChunk(
                 document_id=uuid.UUID(h.payload["document_id"]),
                 chunk_id=str(h.id),
@@ -133,6 +139,11 @@ class RAGService:
             )
             for h in hits
         ]
+        if not bool(rt.get("rag_hybrid_enabled", True)):
+            return candidates[:top_k]
+        alpha = float(rt.get("rag_hybrid_alpha", 0.65))
+        alpha = max(0.0, min(1.0, alpha))
+        return self._hybrid_rerank(query=query, chunks=candidates, top_k=top_k, alpha=alpha)
 
     async def delete_document(self, document_id: uuid.UUID) -> None:
         await self._client.delete(
@@ -199,6 +210,32 @@ class RAGService:
             f"[Источник: {c.title or c.chunk_id}]\n{c.text}" for c in chunks
         )
 
+    @staticmethod
+    def _hybrid_rerank(query: str, chunks: list[RAGChunk], *, top_k: int, alpha: float) -> list[RAGChunk]:
+        if not chunks:
+            return []
+        bm25 = _bm25_scores(query, [c.text for c in chunks])
+        vec_scores = [float(c.score) for c in chunks]
+        vec_min = min(vec_scores)
+        vec_max = max(vec_scores)
+        bm_min = min(bm25) if bm25 else 0.0
+        bm_max = max(bm25) if bm25 else 0.0
+
+        def norm(v: float, lo: float, hi: float) -> float:
+            if hi <= lo:
+                return 0.0
+            return (v - lo) / (hi - lo)
+
+        ranked = []
+        for idx, ch in enumerate(chunks):
+            v = norm(float(ch.score), vec_min, vec_max)
+            b = norm(bm25[idx], bm_min, bm_max)
+            fused = alpha * v + (1.0 - alpha) * b
+            ranked.append((fused, ch))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        out = [c for _, c in ranked[:top_k]]
+        return out
+
 
 @lru_cache(maxsize=1)
 def get_rag_voice() -> RAGService:
@@ -222,3 +259,44 @@ def rag_for_pool(pool: KnowledgePool) -> RAGService:
     if pool == "agent_assist":
         return get_rag_agent_assist()
     return get_rag_voice()
+
+
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _tokenize(text: str) -> list[str]:
+    return _TOKEN_RE.findall((text or "").lower())
+
+
+def _bm25_scores(query: str, docs: list[str], *, k1: float = 1.5, b: float = 0.75) -> list[float]:
+    q_terms = _tokenize(query)
+    if not q_terms or not docs:
+        return [0.0 for _ in docs]
+    doc_tokens = [_tokenize(d) for d in docs]
+    doc_lens = [len(toks) for toks in doc_tokens]
+    avgdl = (sum(doc_lens) / len(doc_lens)) if doc_lens else 0.0
+    if avgdl <= 0:
+        return [0.0 for _ in docs]
+    term_df: Counter[str] = Counter()
+    for toks in doc_tokens:
+        for t in set(toks):
+            term_df[t] += 1
+    n_docs = len(doc_tokens)
+    q_tf = Counter(q_terms)
+    scores: list[float] = []
+    for toks in doc_tokens:
+        tf = Counter(toks)
+        dl = len(toks)
+        s = 0.0
+        for term, qf in q_tf.items():
+            df = term_df.get(term, 0)
+            if df <= 0:
+                continue
+            idf = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5))
+            f = tf.get(term, 0)
+            denom = f + k1 * (1.0 - b + b * (dl / avgdl))
+            if denom <= 0:
+                continue
+            s += idf * ((f * (k1 + 1.0)) / denom) * qf
+        scores.append(s)
+    return scores

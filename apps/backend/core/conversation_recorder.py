@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 
 from apps.backend.models.db import session_scope
 from apps.backend.models.entities import Conversation, ConversationTurn
-from apps.backend.models.schemas import ChatMessage, ConversationTurnOut, EscalationPacket
+from apps.backend.models.schemas import CaseContext, ChatMessage, ConversationTurnOut, EscalationPacket
 from apps.backend.services import get_llm
 from apps.backend.utils.logging import get_logger
 
@@ -85,6 +85,25 @@ class ConversationRecorder:
                 conv.ended_at = now
                 conv.updated_at = now
 
+    async def get_case_state(self) -> dict:
+        async with session_scope() as s:
+            conv = await s.get(Conversation, self.conversation_id)
+            if conv is None:
+                return {}
+            meta = dict(conv.meta or {})
+            data = meta.get("case_state")
+            return data if isinstance(data, dict) else {}
+
+    async def upsert_case_state(self, case_state: dict) -> None:
+        async with session_scope() as s:
+            conv = await s.get(Conversation, self.conversation_id)
+            if conv is None:
+                return
+            meta = dict(conv.meta or {})
+            meta["case_state"] = dict(case_state or {})
+            conv.meta = meta
+            conv.updated_at = datetime.now(timezone.utc)
+
     async def load_turns(self) -> list[ConversationTurn]:
         async with session_scope() as s:
             r = await s.execute(
@@ -124,6 +143,8 @@ class ConversationRecorder:
 
     async def build_escalation_packet(self, *, locale: str, reason: str) -> dict[str, Any]:
         summary = await self.summarize(locale=locale)
+        case_state = await self.get_case_state()
+        case_context = CaseContext.model_validate(case_state or {})
         turns_orm = await self.load_turns()
         turns_out = [
             ConversationTurnOut(
@@ -141,6 +162,7 @@ class ConversationRecorder:
             locale=locale,
             reason=reason,
             summary=summary,
+            case_context=case_context,
             turns=turns_out,
         )
         return pkt.model_dump(mode="json")

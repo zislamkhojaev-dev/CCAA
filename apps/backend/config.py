@@ -87,6 +87,14 @@ class Settings(BaseSettings):
     # ----- Diarization (speech analytics; same contract for future batch jobs) -----
     diarization_provider: Literal["llm", "deepgram", "pyannote", "mock"] = "llm"
 
+    # ----- Voice VAD (before STT) -----
+    voice_vad_backend: Literal["silero_onnx", "webrtc"] = "silero_onnx"
+    silero_vad_onnx_url: str = (
+        "https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/"
+        "src/silero_vad/data/silero_vad.onnx"
+    )
+    silero_vad_cache_dir: str = ""
+
     # ----- Locales -----
     supported_locales: list[str] = Field(default_factory=lambda: ["ru", "uz"])
     default_locale: str = "ru"

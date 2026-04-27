@@ -41,19 +41,10 @@ async def playground_chat_stream(req: PlaygroundRequest) -> StreamingResponse:
       event: token  data: "<text fragment>"
       event: done   data: {}
     """
-    llm = get_llm()
-    rag = get_rag_voice()
     orchestrator = get_orchestrator()
-    intent_detector = IntentDetector(llm)
 
     async def gen():
-        intent_task = asyncio.create_task(
-            intent_detector.detect(req.text, locale=req.locale)
-        )
-        rag_task = asyncio.create_task(
-            rag.search(req.text, locale=req.locale, top_k=5)
-        )
-        intent, sources = await asyncio.gather(intent_task, rag_task)
+        intent, sources = await orchestrator.preview_route(req.text, locale=req.locale)
 
         meta = {
             "intent": intent.model_dump(),
@@ -61,24 +52,13 @@ async def playground_chat_stream(req: PlaygroundRequest) -> StreamingResponse:
         }
         yield _sse("meta", meta)
 
-        if intent.requires_human:
-            yield _sse("token", _handoff(req.locale))
-            yield _sse("done", {})
-            return
-        if not sources:
-            yield _sse("token", fallback_message(req.locale))
-            yield _sse("done", {})
-            return
-
-        messages = orchestrator.build_messages(
-            req.text, req.history, sources, req.locale
-        )
-        rt = get_bot_runtime_payload_sync()
         try:
-            async for delta in llm.stream_complete(
-                messages,
-                temperature=float(rt.get("llm_temperature", 0.2)),
-                max_tokens=int(rt.get("llm_max_tokens", 300)),
+            async for delta in orchestrator.stream_answer_after_route(
+                req.text,
+                intent,
+                sources,
+                locale=req.locale,
+                history=req.history,
             ):
                 yield _sse("token", delta)
         except Exception as exc:  # noqa: BLE001

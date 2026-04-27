@@ -7,6 +7,8 @@ forgets to seed the DB, the bot still refuses to invent answers.
 
 from __future__ import annotations
 
+import random
+
 SYSTEM_PROMPT_RU = """Ты — голосовой ассистент контакт-центра.
 
 ПРАВИЛА:
@@ -44,9 +46,17 @@ NO_CONTEXT_FALLBACK_RU = (
     "К сожалению, у меня нет точной информации по этому вопросу. "
     "Хотите, я переключу вас на оператора?"
 )
+NO_CONTEXT_SOFT_FALLBACK_RU = (
+    "Пока не нахожу точных данных в базе знаний. Уточните, пожалуйста, "
+    "какой именно тариф или услугу вы имеете в виду."
+)
 NO_CONTEXT_FALLBACK_UZ = (
     "Afsus, bu savol bo‘yicha aniq ma’lumotim yo‘q. "
     "Sizni operatorga ulashimni xohlaysizmi?"
+)
+NO_CONTEXT_SOFT_FALLBACK_UZ = (
+    "Hozircha bilim bazasida aniq javob topolmadim. Iltimos, qaysi tarif "
+    "yoki xizmat nazarda tutilganini aniqlashtiring."
 )
 
 
@@ -86,3 +96,25 @@ def system_prompt(
 
 def fallback_message(locale: str) -> str:
     return NO_CONTEXT_FALLBACK_UZ if locale == "uz" else NO_CONTEXT_FALLBACK_RU
+
+
+def fallback_message_soft(locale: str) -> str:
+    return NO_CONTEXT_SOFT_FALLBACK_UZ if locale == "uz" else NO_CONTEXT_SOFT_FALLBACK_RU
+
+
+def silence_nudge_message(locale: str) -> str:
+    if locale == "uz":
+        return random.choice(
+            [
+                "Siz hali ham liniyadasizmi? Agar xohlasangiz, savolni qisqaroq qilib qayta ayting.",
+                "Men shu yerdaman. Qulay bo‘lsa, savolni yana bir bor ayting.",
+                "Suhbatni davom ettiramizmi? Qisqacha nimani aniqlashtiraylik?",
+            ]
+        )
+    return random.choice(
+        [
+            "Вы ещё на линии? Если удобно, повторите, пожалуйста, вопрос коротко.",
+            "Я на связи. Подскажите, пожалуйста, чем помочь дальше?",
+            "Продолжим? Если удобно, сформулируйте вопрос в двух словах.",
+        ]
+    )

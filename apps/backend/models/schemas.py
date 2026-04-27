@@ -168,7 +168,23 @@ class ConversationOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     ended_at: datetime | None = None
+    case_state: dict = Field(default_factory=dict)
     turns: list[ConversationTurnOut] = Field(default_factory=list)
+
+
+class CaseContext(BaseModel):
+    intent: str = "other"
+    stage: Literal["new", "collecting", "diagnosing", "resolved", "handoff"] = "new"
+    intent_confirmed: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    required_slots: list[str] = Field(default_factory=list)
+    collected_slots: dict = Field(default_factory=dict)
+    missing_slots: list[str] = Field(default_factory=list)
+    attempted_steps: list[str] = Field(default_factory=list)
+    clarification_attempts: int = 0
+    resolution_status: Literal["unknown", "in_progress", "resolved", "handoff"] = "unknown"
+    need_handoff: bool = False
+    handoff_reason: str | None = None
 
 
 class EscalationPacket(BaseModel):
@@ -178,4 +194,5 @@ class EscalationPacket(BaseModel):
     locale: str
     reason: str
     summary: str
+    case_context: CaseContext = Field(default_factory=CaseContext)
     turns: list[ConversationTurnOut]

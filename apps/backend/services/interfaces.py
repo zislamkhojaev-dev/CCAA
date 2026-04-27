@@ -51,6 +51,22 @@ class LLMService(ABC):
         max_tokens: int = 512,
     ) -> AsyncIterator[str]: ...
 
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+    ) -> tuple[str, list[dict]]:
+        """Optional native tool-calling API.
+
+        Returns `(assistant_text, tool_calls)` where `tool_calls` is a list of
+        dicts like: `{"name":"...", "arguments": {...}}`.
+        """
+        text = await self.complete(messages, temperature=temperature, max_tokens=max_tokens)
+        return text, []
+
     @abstractmethod
     async def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 

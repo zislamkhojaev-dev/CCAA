@@ -48,18 +48,18 @@ class OpenAITTS(TTSService):
                 continue
             buf.append(delta)
             if any(delta.rstrip().endswith(m) for m in flush_marks) and len("".join(buf)) > 12:
-                async for chunk in self._synth_one("".join(buf), voice_id, voice_tts_params):
-                    yield chunk
+                payload = await self._synth_one("".join(buf), voice_id, voice_tts_params)
+                if payload:
+                    yield payload
                 buf.clear()
 
         tail = "".join(buf).strip()
         if tail:
-            async for chunk in self._synth_one(tail, voice_id, voice_tts_params):
-                yield chunk
+            payload = await self._synth_one(tail, voice_id, voice_tts_params)
+            if payload:
+                yield payload
 
-    async def _synth_one(
-        self, text: str, voice_id: str, voice_tts_params: dict | None
-    ) -> AsyncIterator[bytes]:
+    async def _synth_one(self, text: str, voice_id: str, voice_tts_params: dict | None) -> bytes:
         rt = get_bot_runtime_payload_sync()
         v = voice_tts_params or {}
         try:
@@ -68,6 +68,7 @@ class OpenAITTS(TTSService):
             speed = 1.0
         speed = max(0.25, min(4.0, speed))
         try:
+            out = bytearray()
             async with self._client.audio.speech.with_streaming_response.create(
                 model=self._model,
                 voice=voice_id,  # alloy / echo / fable / onyx / nova / shimmer
@@ -77,11 +78,13 @@ class OpenAITTS(TTSService):
             ) as resp:
                 async for chunk in resp.iter_bytes(chunk_size=4096):
                     if chunk:
-                        yield chunk
+                        out.extend(chunk)
+            return bytes(out)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             log.warning("openai_tts_error", error=str(exc))
+            return b""
 
     async def aclose(self) -> None:
         return None

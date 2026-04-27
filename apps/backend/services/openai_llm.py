@@ -71,3 +71,37 @@ class OpenAILLM(LLMService):
             model=self._embed_model, input=list(texts)
         )
         return [d.embedding for d in resp.data]
+
+    async def complete_with_tools(
+        self,
+        messages: Sequence[ChatMessage],
+        *,
+        tools: list[dict],
+        temperature: float = 0.2,
+        max_tokens: int = 512,
+    ) -> tuple[str, list[dict]]:
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            messages=self._to_openai(messages),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice="auto",
+        )
+        msg = resp.choices[0].message
+        text = (msg.content or "").strip()
+        out_calls: list[dict] = []
+        for tc in (msg.tool_calls or []):
+            if tc.type != "function" or not tc.function:
+                continue
+            raw_args = tc.function.arguments or "{}"
+            try:
+                import json
+
+                args = json.loads(raw_args)
+            except Exception:  # noqa: BLE001
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            out_calls.append({"name": tc.function.name, "arguments": args})
+        return text, out_calls
