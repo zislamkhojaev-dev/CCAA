@@ -97,6 +97,17 @@ _EXPLICIT_HANDOFF_SUBSTR: tuple[str, ...] = (
     "живого оператора",
     "odam",
 )
+_SMALLTALK_GREETING_SUBSTR: tuple[str, ...] = (
+    "привет",
+    "здравств",
+    "добрый",
+    "hello",
+    "hi",
+    "salom",
+    "assalomu",
+)
+_SMALLTALK_THANKS_SUBSTR: tuple[str, ...] = ("спасибо", "благодар", "rahmat", "thank")
+_SMALLTALK_GOODBYE_SUBSTR: tuple[str, ...] = ("пока", "до свид", "goodbye", "bye", "xayr")
 
 _lock = threading.Lock()
 _embedder = None
@@ -247,6 +258,21 @@ def _max_cos(q: np.ndarray, mat: np.ndarray) -> float:
 def _explicit_handoff(text: str) -> bool:
     t = (text or "").lower()
     return any(s in t for s in _EXPLICIT_HANDOFF_SUBSTR)
+
+
+def is_explicit_handoff(text: str) -> bool:
+    return _explicit_handoff(text)
+
+
+def match_smalltalk_keyword(text: str) -> str | None:
+    t = (text or "").lower()
+    if any(k in t for k in _SMALLTALK_GREETING_SUBSTR):
+        return "greeting"
+    if any(k in t for k in _SMALLTALK_THANKS_SUBSTR):
+        return "thanks"
+    if any(k in t for k in _SMALLTALK_GOODBYE_SUBSTR):
+        return "goodbye"
+    return None
 
 
 def _best_sim_per_intent(ids: list[str], sims: np.ndarray) -> dict[str, float]:

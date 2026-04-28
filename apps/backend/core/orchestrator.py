@@ -721,7 +721,17 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="empty_or_silence",
         )
-    if any(k in t for k in ("оператор", "человек", "human", "agent", "переключи", "позови")):
+    try:
+        from apps.backend.core import semantic_local as sem
+
+        explicit_handoff = sem.is_explicit_handoff(t)
+        smalltalk = sem.match_smalltalk_keyword(t)
+    except Exception:  # noqa: BLE001
+        explicit_handoff = any(
+            k in t for k in ("оператор", "человек", "human", "agent", "переключи", "позови")
+        )
+        smalltalk = None
+    if explicit_handoff:
         return RouteDecision(
             route_class=RouteClass.ESCALATION,
             confidence=esc_conf,
@@ -730,7 +740,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=True,
             reason="explicit_handoff_request",
         )
-    if any(k in t for k in ("привет", "здравств", "добрый", "hello", "hi", "salom", "assalomu")):
+    if smalltalk == "greeting":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -739,7 +749,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="smalltalk_greeting",
         )
-    if any(k in t for k in ("спасибо", "благодар", "rahmat", "thank")):
+    if smalltalk == "thanks":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -748,7 +758,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="smalltalk_thanks",
         )
-    if any(k in t for k in ("пока", "до свид", "goodbye", "bye", "xayr")):
+    if smalltalk == "goodbye":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -838,6 +848,9 @@ class AgentWorkflowGraph:
 def _pick_variant(options: list[str]) -> str:
     if not options:
         return ""
+    rt = get_bot_runtime_payload_sync()
+    if bool(rt.get("smalltalk_deterministic_enabled", False)):
+        return options[0]
     # Small non-deterministic variation so greetings are less repetitive.
     return random.choice(options)
 

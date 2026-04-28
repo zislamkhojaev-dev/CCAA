@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import random
 
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
+
 SYSTEM_PROMPT_RU = """Ты — голосовой ассистент контакт-центра.
 
 ПРАВИЛА:
@@ -95,11 +97,21 @@ def system_prompt(
 
 
 def fallback_message(locale: str) -> str:
-    return NO_CONTEXT_FALLBACK_UZ if locale == "uz" else NO_CONTEXT_FALLBACK_RU
+    rt = get_bot_runtime_payload_sync()
+    if locale == "uz":
+        custom = str(rt.get("fallback_message_uz") or "").strip()
+        return custom or NO_CONTEXT_FALLBACK_UZ
+    custom = str(rt.get("fallback_message_ru") or "").strip()
+    return custom or NO_CONTEXT_FALLBACK_RU
 
 
 def fallback_message_soft(locale: str) -> str:
-    return NO_CONTEXT_SOFT_FALLBACK_UZ if locale == "uz" else NO_CONTEXT_SOFT_FALLBACK_RU
+    rt = get_bot_runtime_payload_sync()
+    if locale == "uz":
+        custom = str(rt.get("fallback_message_soft_uz") or "").strip()
+        return custom or NO_CONTEXT_SOFT_FALLBACK_UZ
+    custom = str(rt.get("fallback_message_soft_ru") or "").strip()
+    return custom or NO_CONTEXT_SOFT_FALLBACK_RU
 
 
 def silence_nudge_message(locale: str) -> str:

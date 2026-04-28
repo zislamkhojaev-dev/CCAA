@@ -26,7 +26,11 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "barge_in_cooldown_ms": 700,
     "barge_in_hold_frames": 3,
     "ws_voice_max_connections": 50,
+    "ws_voice_max_connections_per_ip": 8,
+    "ws_voice_max_connections_per_token": 4,
     "ws_agent_assist_max_connections": 100,
+    "ws_agent_assist_max_connections_per_ip": 12,
+    "ws_agent_assist_max_connections_per_token": 6,
     # VAD (Silero ONNX / WebRTC) — RMS threshold only used by legacy STT-side gates if any
     "stt_voice_rms_threshold": 0.008,
     "vad_silero_speech_threshold": 0.45,
@@ -71,6 +75,13 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "tts_micro_batch_chars": 40,
     # Fallback anti-spam
     "fallback_cooldown_sec": 2.5,
+    "fallback_message_ru": "",
+    "fallback_message_uz": "",
+    "fallback_message_soft_ru": "",
+    "fallback_message_soft_uz": "",
+    "low_signal_message_ru": "",
+    "low_signal_message_uz": "",
+    "smalltalk_deterministic_enabled": False,
     # Rich semantic router thresholds/policies
     "router_noise_max_words": 2,
     "router_noise_max_chars": 14,

@@ -53,6 +53,172 @@ type BotRuntime = {
   barge_in_hold_frames?: number;
 };
 
+const MSE_MIME = "audio/mpeg";
+
+function mseSupported(): boolean {
+  if (typeof window === "undefined") return false;
+  if (!("MediaSource" in window)) return false;
+  try {
+    return MediaSource.isTypeSupported(MSE_MIME);
+  } catch {
+    return false;
+  }
+}
+
+class MseAudioPlayer {
+  private audio: HTMLAudioElement;
+  private onSegmentDone: (idx: number) => void;
+  private mediaSource: MediaSource | null = null;
+  private sourceBuffer: SourceBuffer | null = null;
+  private pending: ArrayBuffer[] = [];
+  private ready = false;
+  private segEnds = new Map<number, number>();
+  private pendingSegEnd: number | null = null;
+  private rafId: number | null = null;
+  private objectUrl: string | null = null;
+
+  constructor(audio: HTMLAudioElement, onSegmentDone: (idx: number) => void) {
+    this.audio = audio;
+    this.onSegmentDone = onSegmentDone;
+  }
+
+  start(): boolean {
+    try {
+      this.mediaSource = new MediaSource();
+      this.objectUrl = URL.createObjectURL(this.mediaSource);
+      this.audio.src = this.objectUrl;
+      this.mediaSource.addEventListener("sourceopen", () => this.onSourceOpen(), { once: true });
+      this.audio.play().catch(() => {});
+      this.rafId = requestAnimationFrame(this.tick);
+      return true;
+    } catch {
+      this.destroy();
+      return false;
+    }
+  }
+
+  private onSourceOpen() {
+    if (!this.mediaSource) return;
+    try {
+      const sb = this.mediaSource.addSourceBuffer(MSE_MIME);
+      sb.mode = "sequence";
+      sb.addEventListener("updateend", () => this.onUpdateEnd());
+      this.sourceBuffer = sb;
+      this.ready = true;
+      this.drain();
+    } catch {
+      // Ignore: fallback will take over via push() returning false.
+    }
+  }
+
+  push(buf: ArrayBuffer) {
+    this.pending.push(buf);
+    this.drain();
+  }
+
+  markSegmentEnd(idx: number) {
+    this.pendingSegEnd = idx;
+    if (this.sourceBuffer && !this.sourceBuffer.updating && this.pending.length === 0) {
+      this.captureSegEnd();
+    }
+  }
+
+  private onUpdateEnd() {
+    if (this.pendingSegEnd !== null && this.pending.length === 0) {
+      this.captureSegEnd();
+    }
+    this.drain();
+  }
+
+  private captureSegEnd() {
+    if (this.pendingSegEnd === null || !this.sourceBuffer) return;
+    const ranges = this.sourceBuffer.buffered;
+    const endPos = ranges.length > 0 ? ranges.end(ranges.length - 1) : 0;
+    this.segEnds.set(this.pendingSegEnd, endPos);
+    this.pendingSegEnd = null;
+  }
+
+  private tick = () => {
+    this.rafId = requestAnimationFrame(this.tick);
+    if (this.segEnds.size === 0) return;
+    const t = this.audio.currentTime;
+    for (const [idx, endPos] of [...this.segEnds.entries()]) {
+      if (t >= endPos - 0.05) {
+        this.segEnds.delete(idx);
+        this.onSegmentDone(idx);
+      }
+    }
+  };
+
+  private drain() {
+    if (!this.ready || !this.sourceBuffer || this.sourceBuffer.updating) return;
+    const next = this.pending.shift();
+    if (!next) return;
+    try {
+      this.sourceBuffer.appendBuffer(next);
+    } catch {
+      // QuotaExceededError or invalid state: drop and continue.
+    }
+  }
+
+  flush() {
+    this.pending = [];
+    this.segEnds.clear();
+    this.pendingSegEnd = null;
+    if (this.sourceBuffer) {
+      try {
+        if (this.sourceBuffer.updating) this.sourceBuffer.abort();
+      } catch {
+        /* ignore */
+      }
+      try {
+        const buf = this.sourceBuffer.buffered;
+        if (buf.length > 0) {
+          this.sourceBuffer.remove(0, buf.end(buf.length - 1));
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      this.audio.pause();
+      this.audio.currentTime = 0;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  destroy() {
+    if (this.rafId !== null) cancelAnimationFrame(this.rafId);
+    this.rafId = null;
+    try {
+      if (this.mediaSource && this.mediaSource.readyState === "open") {
+        this.mediaSource.endOfStream();
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      this.audio.pause();
+      this.audio.removeAttribute("src");
+      this.audio.load();
+    } catch {
+      /* ignore */
+    }
+    if (this.objectUrl) {
+      try {
+        URL.revokeObjectURL(this.objectUrl);
+      } catch {
+        /* ignore */
+      }
+      this.objectUrl = null;
+    }
+    this.sourceBuffer = null;
+    this.mediaSource = null;
+    this.ready = false;
+  }
+}
+
 export default function VoicePage() {
   const wsRef = useRef<WebSocket | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -68,10 +234,11 @@ export default function VoicePage() {
   const bargeInCooldownMsRef = useRef(DEFAULT_BARGE_IN_COOLDOWN_MS);
   const bargeInHoldFramesRef = useRef(DEFAULT_BARGE_IN_HOLD_FRAMES);
 
-  const audioQueueRef = useRef<Array<{ blob: Blob; segmentIndex: number | null }>>([]);
-  const playingRef = useRef(false);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
   const incomingSegmentRef = useRef<number | null>(null);
+  const playerRef = useRef<MseAudioPlayer | null>(null);
+  const fallbackQueueRef = useRef<Array<{ blob: Blob; segmentIndex: number | null }>>([]);
+  const fallbackPlayingRef = useRef(false);
 
   const [status, setStatus] = useState<Status>("idle");
   const [locale, setLocale] = useState<"ru" | "uz">("ru");
@@ -131,10 +298,55 @@ export default function VoicePage() {
     };
   }, []);
 
+  function ensureAudioEl(): HTMLAudioElement {
+    let a = audioElRef.current;
+    if (!a) {
+      a = new Audio();
+      audioElRef.current = a;
+    }
+    return a;
+  }
+
+  function ackSegment(idx: number) {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "audio_played_ack", index: idx }));
+    }
+  }
+
+  function pushAudioChunk(buf: ArrayBuffer) {
+    botSpeakingRef.current = true;
+    const player = playerRef.current;
+    if (player) {
+      player.push(buf);
+      return;
+    }
+    const blob = new Blob([buf], { type: MSE_MIME });
+    fallbackQueueRef.current.push({
+      blob,
+      segmentIndex: incomingSegmentRef.current,
+    });
+    fallbackPlayNext();
+  }
+
+  function markSegmentEndForPlayback(idx: number) {
+    const player = playerRef.current;
+    if (player) {
+      player.markSegmentEnd(idx);
+    } else {
+      ackSegment(idx);
+    }
+  }
+
   function flushPlayback() {
-    audioQueueRef.current = [];
-    playingRef.current = false;
     botSpeakingRef.current = false;
+    const player = playerRef.current;
+    if (player) {
+      player.flush();
+      return;
+    }
+    fallbackQueueRef.current = [];
+    fallbackPlayingRef.current = false;
     const a = audioElRef.current;
     if (a) {
       a.pause();
@@ -143,36 +355,32 @@ export default function VoicePage() {
     }
   }
 
-  function playNext() {
-    if (playingRef.current) return;
-    const item = audioQueueRef.current.shift();
+  function fallbackPlayNext() {
+    if (fallbackPlayingRef.current) return;
+    const item = fallbackQueueRef.current.shift();
     if (!item) {
       botSpeakingRef.current = false;
       return;
     }
     const { blob, segmentIndex } = item;
-    playingRef.current = true;
+    fallbackPlayingRef.current = true;
     botSpeakingRef.current = true;
     const url = URL.createObjectURL(blob);
-    const audio = audioElRef.current ?? new Audio();
-    audioElRef.current = audio;
+    const audio = ensureAudioEl();
     audio.src = url;
     audio.onended = () => {
-      const ws = wsRef.current;
-      if (segmentIndex != null && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "audio_played_ack", index: segmentIndex }));
-      }
+      if (segmentIndex != null) ackSegment(segmentIndex);
       URL.revokeObjectURL(url);
-      playingRef.current = false;
-      playNext();
+      fallbackPlayingRef.current = false;
+      fallbackPlayNext();
     };
     audio.onerror = () => {
       URL.revokeObjectURL(url);
-      playingRef.current = false;
-      playNext();
+      fallbackPlayingRef.current = false;
+      fallbackPlayNext();
     };
     audio.play().catch(() => {
-      playingRef.current = false;
+      fallbackPlayingRef.current = false;
     });
   }
 
@@ -238,6 +446,18 @@ export default function VoicePage() {
       await ctx.audioWorklet.addModule(moduleUrl);
       URL.revokeObjectURL(moduleUrl);
 
+      const audio = ensureAudioEl();
+      if (mseSupported()) {
+        const player = new MseAudioPlayer(audio, ackSegment);
+        if (player.start()) {
+          playerRef.current = player;
+        } else {
+          playerRef.current = null;
+        }
+      } else {
+        playerRef.current = null;
+      }
+
       const sp = new URLSearchParams({
         locale,
         sample_rate: String(TARGET_SAMPLE_RATE),
@@ -263,6 +483,8 @@ export default function VoicePage() {
               incomingSegmentRef.current = Number(evtData.index ?? -1);
             }
             if (evtType === "audio_segment_end") {
+              const idx = Number(evtData.index ?? incomingSegmentRef.current ?? -1);
+              if (idx >= 0) markSegmentEndForPlayback(idx);
               incomingSegmentRef.current = null;
             }
             if (evtType === "session" && evtData.conversation_id)
@@ -276,10 +498,9 @@ export default function VoicePage() {
           }
           return;
         }
-        const blob = new Blob([ev.data], { type: "audio/mpeg" });
-        setBytesRecv((n) => n + blob.size);
-        audioQueueRef.current.push({ blob, segmentIndex: incomingSegmentRef.current });
-        playNext();
+        const buf = ev.data as ArrayBuffer;
+        setBytesRecv((n) => n + buf.byteLength);
+        pushAudioChunk(buf);
       };
       ws.onerror = () => setError("WebSocket error");
       ws.onclose = () => {
@@ -342,6 +563,10 @@ export default function VoicePage() {
     analyserRef.current?.disconnect();
     streamRef.current?.getTracks().forEach((t) => t.stop());
     ctxRef.current?.close().catch(() => undefined);
+    if (playerRef.current) {
+      playerRef.current.destroy();
+      playerRef.current = null;
+    }
     workletRef.current = null;
     analyserRef.current = null;
     streamRef.current = null;

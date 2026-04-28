@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 from fastapi.responses import PlainTextResponse
 
-from apps.backend.utils.slo_metrics import snapshot_percentiles
+from apps.backend.utils.slo_metrics import snapshot_histograms, snapshot_percentiles
 from apps.backend.utils.resilience import snapshot_resilience_stats
 
 router = APIRouter()
@@ -17,6 +17,7 @@ async def slo_snapshot() -> dict:
 @router.get("/metrics", response_class=PlainTextResponse)
 async def prometheus_metrics() -> PlainTextResponse:
     snap = snapshot_percentiles()
+    hist = snapshot_histograms()
     res = await snapshot_resilience_stats()
     lines: list[str] = []
     lines.append("# HELP voiceagent_latency_samples Number of latency samples in window")
@@ -33,6 +34,19 @@ async def prometheus_metrics() -> PlainTextResponse:
         lines.append(f'voiceagent_latency_ms{{metric="{m}",quantile="0.50"}} {p50}')
         lines.append(f'voiceagent_latency_ms{{metric="{m}",quantile="0.95"}} {p95}')
         lines.append(f'voiceagent_latency_ms{{metric="{m}",quantile="1.00"}} {max_v}')
+    lines.append("# HELP voiceagent_latency_bucket Latency histogram buckets (milliseconds)")
+    lines.append("# TYPE voiceagent_latency_bucket histogram")
+    for metric, row in sorted(hist.items()):
+        m = metric.replace(".", "_").replace("-", "_")
+        buckets = row.get("buckets", {})
+        if isinstance(buckets, dict):
+            for le, cnt in sorted(
+                buckets.items(),
+                key=lambda kv: float("inf") if kv[0] == "+Inf" else float(kv[0]),
+            ):
+                lines.append(f'voiceagent_latency_bucket{{metric="{m}",le="{le}"}} {int(cnt)}')
+        lines.append(f'voiceagent_latency_bucket_sum{{metric="{m}"}} {float(row.get("sum_ms", 0.0))}')
+        lines.append(f'voiceagent_latency_bucket_count{{metric="{m}"}} {int(row.get("count", 0))}')
     lines.append("# HELP voiceagent_resilience_total Resilience subsystem counters")
     lines.append("# TYPE voiceagent_resilience_total counter")
     for name, val in sorted(res.items()):

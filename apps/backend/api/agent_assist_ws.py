@@ -19,8 +19,31 @@ log = get_logger(__name__)
 @router.websocket("/ws/agent-assist")
 async def agent_assist_ws(ws: WebSocket) -> None:
     rt = get_bot_runtime_payload_sync()
-    max_conn = max(1, int(rt.get("ws_agent_assist_max_connections", 100)))
-    if not await ws_try_acquire("agent_assist_ws", max_conn):
+    acquired_scopes: list[str] = []
+    max_global = max(1, int(rt.get("ws_agent_assist_max_connections", 100)))
+    ip = (ws.client.host if ws.client else "") or "unknown"
+    token = str(ws.query_params.get("token") or ws.query_params.get("session_token") or "").strip()
+    scopes: list[tuple[str, int]] = [("agent_assist_ws", max_global)]
+    scopes.append(
+        (
+            f"agent_assist_ws:ip:{ip}",
+            max(1, int(rt.get("ws_agent_assist_max_connections_per_ip", 12))),
+        )
+    )
+    if token:
+        scopes.append(
+            (
+                f"agent_assist_ws:token:{token}",
+                max(1, int(rt.get("ws_agent_assist_max_connections_per_token", 6))),
+            )
+        )
+    for scope, limit in scopes:
+        ok = await ws_try_acquire(scope, limit)
+        if ok:
+            acquired_scopes.append(scope)
+            continue
+        for acq in reversed(acquired_scopes):
+            await ws_release(acq)
         await ws.accept()
         await ws.send_json({"type": "error", "message": "too_many_connections"})
         await ws.close(code=1013)
@@ -71,7 +94,8 @@ async def agent_assist_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         log.info("agent_assist_disconnected")
     finally:
-        await ws_release("agent_assist_ws")
+        for scope in reversed(acquired_scopes):
+            await ws_release(scope)
         try:
             await ws.close()
         except RuntimeError:
