@@ -512,6 +512,8 @@ class Orchestrator:
             return _AgentResult(answer="")
         rt = get_bot_runtime_payload_sync()
         max_steps = max(1, int(rt.get("agent_tool_loop_max_steps", 3)))
+        budget_ms = max(100, int(rt.get("agent_tool_loop_budget_ms", 1200)))
+        deadline = time.monotonic() + (budget_ms / 1000.0)
         messages = self.build_messages(text, history, sources, locale)
         messages[0] = ChatMessage(
             role="system",
@@ -525,21 +527,39 @@ class Orchestrator:
             ),
         )
         for _ in range(max_steps):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning("agent_tool_loop_budget_exceeded", budget_ms=budget_ms)
+                return _AgentResult(answer=fallback_message_soft(locale))
             raw = ""
             native_calls: list[dict] = []
             if rt.get("native_function_calling_enabled", True):
-                raw, native_calls = await self._llm.complete_with_tools(
-                    messages,
-                    tools=_TOOL_SCHEMAS,
-                    temperature=float(rt.get("llm_temperature", 0.2)),
-                    max_tokens=int(rt.get("llm_max_tokens", 300)),
-                )
+                try:
+                    raw, native_calls = await asyncio.wait_for(
+                        self._llm.complete_with_tools(
+                            messages,
+                            tools=_TOOL_SCHEMAS,
+                            temperature=float(rt.get("llm_temperature", 0.2)),
+                            max_tokens=int(rt.get("llm_max_tokens", 300)),
+                        ),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning("agent_tool_loop_llm_timeout", budget_ms=budget_ms)
+                    return _AgentResult(answer=fallback_message_soft(locale))
             else:
-                raw = await self._llm.complete(
-                    messages,
-                    temperature=float(rt.get("llm_temperature", 0.2)),
-                    max_tokens=int(rt.get("llm_max_tokens", 300)),
-                )
+                try:
+                    raw = await asyncio.wait_for(
+                        self._llm.complete(
+                            messages,
+                            temperature=float(rt.get("llm_temperature", 0.2)),
+                            max_tokens=int(rt.get("llm_max_tokens", 300)),
+                        ),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning("agent_tool_loop_llm_timeout", budget_ms=budget_ms)
+                    return _AgentResult(answer=fallback_message_soft(locale))
             if native_calls:
                 tool_name = str(native_calls[0].get("name") or "")
                 args = native_calls[0].get("arguments") or {}

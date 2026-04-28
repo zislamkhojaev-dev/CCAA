@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 
 from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
@@ -56,6 +57,7 @@ class CaseDecision:
 class CaseManager:
     def __init__(self) -> None:
         self._llm = get_llm()
+        self._phrase_cache: dict[str, tuple[float, str]] = {}
 
     async def evaluate_turn(
         self,
@@ -332,6 +334,12 @@ class CaseManager:
         return "manual"
 
     async def _intent_confirmation_phrase(self, *, intent: IntentResult, locale: str, runtime: dict) -> str:
+        cache_ttl = max(0.0, float(runtime.get("case_dynamic_phrase_cache_ttl_sec", 600.0)))
+        cache_max = max(64, int(runtime.get("case_dynamic_phrase_cache_max_entries", 512)))
+        cache_key = f"intent:{locale}:{intent.intent}"
+        cached = self._phrase_cache_get(cache_key, ttl_sec=cache_ttl)
+        if cached:
+            return cached
         if bool(runtime.get("case_use_dynamic_phrasing", True)):
             strict_intents = runtime.get("case_strict_template_intents") or []
             if intent.intent not in strict_intents:
@@ -340,6 +348,7 @@ class CaseManager:
                     locale=locale,
                 )
                 if generated:
+                    self._phrase_cache_put(cache_key, generated, max_entries=cache_max)
                     return generated
         templates = runtime.get("case_intent_confirmation_templates") or {}
         if isinstance(templates, dict):
@@ -347,15 +356,21 @@ class CaseManager:
             if isinstance(intent_tpl, dict):
                 txt = intent_tpl.get(locale)
                 if isinstance(txt, str) and txt.strip():
-                    return txt.format(intent=intent.intent).strip()
+                    out = txt.format(intent=intent.intent).strip()
+                    self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+                    return out
             default_tpl = templates.get("default")
             if isinstance(default_tpl, dict):
                 txt = default_tpl.get(locale)
                 if isinstance(txt, str) and txt.strip():
-                    return txt.format(intent=intent.intent).strip()
+                    out = txt.format(intent=intent.intent).strip()
+                    self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+                    return out
         ru = f"Правильно понимаю, что вопрос по теме «{intent.intent}»?"
         uz = f"To'g'ri tushundimmi, savol «{intent.intent}» mavzusi bo'yichami?"
-        return uz if locale == "uz" else ru
+        out = uz if locale == "uz" else ru
+        self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+        return out
 
     async def _clarify_question(
         self,
@@ -365,6 +380,12 @@ class CaseManager:
         runtime: dict,
         intent: IntentResult,
     ) -> str:
+        cache_ttl = max(0.0, float(runtime.get("case_dynamic_phrase_cache_ttl_sec", 600.0)))
+        cache_max = max(64, int(runtime.get("case_dynamic_phrase_cache_max_entries", 512)))
+        cache_key = f"slot:{locale}:{intent.intent}:{slot}"
+        cached = self._phrase_cache_get(cache_key, ttl_sec=cache_ttl)
+        if cached:
+            return cached
         if bool(runtime.get("case_use_dynamic_phrasing", True)):
             strict_slots = runtime.get("case_strict_template_slots") or []
             if slot not in strict_slots:
@@ -374,6 +395,7 @@ class CaseManager:
                     locale=locale,
                 )
                 if generated:
+                    self._phrase_cache_put(cache_key, generated, max_entries=cache_max)
                     return generated
         templates = runtime.get("case_slot_question_templates") or {}
         if isinstance(templates, dict):
@@ -381,12 +403,16 @@ class CaseManager:
             if isinstance(slot_tpl, dict):
                 txt = slot_tpl.get(locale)
                 if isinstance(txt, str) and txt.strip():
-                    return txt.strip()
+                    out = txt.strip()
+                    self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+                    return out
             default_tpl = templates.get("default")
             if isinstance(default_tpl, dict):
                 txt = default_tpl.get(locale)
                 if isinstance(txt, str) and txt.strip():
-                    return txt.strip()
+                    out = txt.strip()
+                    self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+                    return out
         ru_map = {
             "card_last4": "Подскажите, пожалуйста, последние 4 цифры карты.",
             "incident_time": "Когда примерно возникла проблема?",
@@ -416,8 +442,33 @@ class CaseManager:
             "product_name": "Qaysi mahsulot yoki tarif sizni qiziqtiryapti?",
         }
         if locale == "uz":
-            return uz_map.get(slot, "Iltimos, masalani aniqlashtirish uchun qo'shimcha ma'lumot bering.")
-        return ru_map.get(slot, "Уточните, пожалуйста, дополнительную деталь по вашему запросу.")
+            out = uz_map.get(slot, "Iltimos, masalani aniqlashtirish uchun qo'shimcha ma'lumot bering.")
+            self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+            return out
+        out = ru_map.get(slot, "Уточните, пожалуйста, дополнительную деталь по вашему запросу.")
+        self._phrase_cache_put(cache_key, out, max_entries=cache_max)
+        return out
+
+    def _phrase_cache_get(self, key: str, *, ttl_sec: float) -> str:
+        if ttl_sec <= 0:
+            return ""
+        row = self._phrase_cache.get(key)
+        if row is None:
+            return ""
+        ts, text = row
+        if (time.monotonic() - ts) > ttl_sec:
+            self._phrase_cache.pop(key, None)
+            return ""
+        return text
+
+    def _phrase_cache_put(self, key: str, text: str, *, max_entries: int) -> None:
+        if not text:
+            return
+        self._phrase_cache[key] = (time.monotonic(), text)
+        if len(self._phrase_cache) <= max_entries:
+            return
+        oldest_key = min(self._phrase_cache.items(), key=lambda kv: kv[1][0])[0]
+        self._phrase_cache.pop(oldest_key, None)
 
     async def _generate_dynamic_intent_confirmation(self, *, intent: str, locale: str) -> str:
         sys = (

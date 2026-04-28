@@ -27,18 +27,22 @@ class ConversationRecorder:
         self.conversation_id = conversation_id
         self._seq_lock = asyncio.Lock()
         self._llm = get_llm()
+        self._seq_cursor: int | None = None
 
     async def _next_seq(self) -> int:
         async with self._seq_lock:
-            async with session_scope() as s:
-                r = await s.execute(
-                    select(ConversationTurn.seq)
-                    .where(ConversationTurn.conversation_id == self.conversation_id)
-                    .order_by(ConversationTurn.seq.desc())
-                    .limit(1)
-                )
-                last = r.scalar_one_or_none()
-                return (last or 0) + 1
+            if self._seq_cursor is None:
+                async with session_scope() as s:
+                    r = await s.execute(
+                        select(ConversationTurn.seq)
+                        .where(ConversationTurn.conversation_id == self.conversation_id)
+                        .order_by(ConversationTurn.seq.desc())
+                        .limit(1)
+                    )
+                    last = r.scalar_one_or_none()
+                    self._seq_cursor = int(last or 0)
+            self._seq_cursor += 1
+            return self._seq_cursor
 
     async def add_turn(self, role: Role, content: str, *, extra: dict | None = None) -> None:
         content = (content or "").strip()

@@ -18,6 +18,7 @@ from apps.backend.config import get_settings
 from apps.backend.models.schemas import ChatMessage
 from apps.backend.services.interfaces import LLMService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker, retry_async
 
 log = get_logger(__name__)
 
@@ -34,6 +35,7 @@ class LocalHttpLLM(LLMService):
         self._client = httpx.AsyncClient(base_url=base, headers=headers, timeout=120.0)
         self._chat_model = s.local_llm_chat_model
         self._embed_model = s.local_llm_embed_model
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=15.0)
 
     @staticmethod
     def _msgs(messages: Sequence[ChatMessage]) -> list[dict]:
@@ -46,16 +48,27 @@ class LocalHttpLLM(LLMService):
         temperature: float = 0.2,
         max_tokens: int = 512,
     ) -> str:
+        if not await self._breaker.before_call():
+            log.warning("local_llm_circuit_open", operation="complete")
+            return ""
         body = {
             "model": self._chat_model,
             "messages": self._msgs(messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
-        r = await self._client.post("/v1/chat/completions", json=body)
-        r.raise_for_status()
-        data = r.json()
-        return (data["choices"][0]["message"]["content"] or "").strip()
+        try:
+            r = await retry_async(
+                lambda: self._client.post("/v1/chat/completions", json=body),
+                attempts=2,
+            )
+            r.raise_for_status()
+            data = r.json()
+            await self._breaker.on_success()
+            return (data["choices"][0]["message"]["content"] or "").strip()
+        except Exception:  # noqa: BLE001
+            await self._breaker.on_failure()
+            raise
 
     async def stream_complete(
         self,
@@ -90,11 +103,22 @@ class LocalHttpLLM(LLMService):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
+        if not await self._breaker.before_call():
+            log.warning("local_llm_circuit_open", operation="embed")
+            return []
         body = {"model": self._embed_model, "input": list(texts)}
-        r = await self._client.post("/v1/embeddings", json=body)
-        r.raise_for_status()
-        data = r.json()
-        return [d["embedding"] for d in data["data"]]
+        try:
+            r = await retry_async(
+                lambda: self._client.post("/v1/embeddings", json=body),
+                attempts=2,
+            )
+            r.raise_for_status()
+            data = r.json()
+            await self._breaker.on_success()
+            return [d["embedding"] for d in data["data"]]
+        except Exception:  # noqa: BLE001
+            await self._breaker.on_failure()
+            raise
 
     async def aclose(self) -> None:
         await self._client.aclose()

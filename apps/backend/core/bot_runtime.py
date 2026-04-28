@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
+import time
 from typing import Any
 
 from apps.backend.models.db import session_scope
@@ -23,10 +25,14 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "barge_in_rms_threshold": 0.12,
     "barge_in_cooldown_ms": 700,
     "barge_in_hold_frames": 3,
+    "ws_voice_max_connections": 50,
+    "ws_agent_assist_max_connections": 100,
     # VAD (Silero ONNX / WebRTC) — RMS threshold only used by legacy STT-side gates if any
     "stt_voice_rms_threshold": 0.008,
     "vad_silero_speech_threshold": 0.45,
     "vad_webrtc_aggressiveness": 2,
+    "vad_prebuffer_sec": 0.3,
+    "vad_hangover_sec": 0.25,
     "stt_min_voiced_seconds": 0.2,
     "stt_duplicate_cooldown_sec": 4.0,
     # After STT emits is_final, wait this long for another final before starting a turn
@@ -38,10 +44,13 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "semantic_cache_ttl_sec": 90.0,
     "semantic_cache_max_entries": 256,
     "agent_tool_loop_max_steps": 3,
+    "agent_tool_loop_budget_ms": 1200,
     "native_function_calling_enabled": True,
     "rag_hybrid_enabled": True,
     "rag_hybrid_alpha": 0.65,
     "rag_candidate_pool_size": 30,
+    "rag_query_embed_cache_ttl_sec": 300.0,
+    "rag_query_embed_cache_max_entries": 4096,
     # Semantic router + dialog stability preset
     "semantic_router_fast_enabled": True,
     "semantic_router_embed_enabled": True,
@@ -81,6 +90,8 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "case_confirm_intent_min_confidence": 0.72,
     # Hybrid phrasing: keep process deterministic, wording dynamic.
     "case_use_dynamic_phrasing": True,
+    "case_dynamic_phrase_cache_ttl_sec": 600.0,
+    "case_dynamic_phrase_cache_max_entries": 512,
     "case_strict_template_intents": ["block_card", "transfer_money", "personal_data"],
     "case_strict_template_slots": ["card_last4", "customer_id", "source_account", "target_account"],
     "case_intent_confirmation_templates": {
@@ -158,6 +169,7 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
 }
 
 _sync_merged: dict[str, Any] = copy.deepcopy(DEFAULT_PAYLOAD)
+_last_refresh_monotonic = 0.0
 
 
 def invalidate_bot_runtime_cache() -> None:
@@ -172,7 +184,7 @@ def get_bot_runtime_payload_sync() -> dict[str, Any]:
 
 async def get_bot_runtime_payload() -> dict[str, Any]:
     """Загрузка из БД и обновление синхронного снимка (для STT/TTS без async)."""
-    global _sync_merged
+    global _sync_merged, _last_refresh_monotonic
     merged = copy.deepcopy(DEFAULT_PAYLOAD)
     try:
         async with session_scope() as s:
@@ -182,6 +194,7 @@ async def get_bot_runtime_payload() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         log.warning("bot_runtime_load_failed", error=str(exc))
     _sync_merged = merged
+    _last_refresh_monotonic = time.monotonic()
     return copy.deepcopy(merged)
 
 
@@ -199,3 +212,16 @@ async def save_bot_runtime_payload(payload: dict[str, Any]) -> dict[str, Any]:
     invalidate_bot_runtime_cache()
     await get_bot_runtime_payload()
     return copy.deepcopy(_sync_merged)
+
+
+async def periodic_bot_runtime_refresh(stop_event: asyncio.Event) -> None:
+    """Periodic DB refresh so each worker converges to the latest runtime config."""
+    while not stop_event.is_set():
+        try:
+            await get_bot_runtime_payload()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bot_runtime_periodic_refresh_failed", error=str(exc))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=5.0)
+        except TimeoutError:
+            continue

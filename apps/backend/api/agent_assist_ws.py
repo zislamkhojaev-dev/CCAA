@@ -6,8 +6,11 @@ import json
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.core import AgentAssist
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.ws_limits import release as ws_release
+from apps.backend.utils.ws_limits import try_acquire as ws_try_acquire
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -15,6 +18,13 @@ log = get_logger(__name__)
 
 @router.websocket("/ws/agent-assist")
 async def agent_assist_ws(ws: WebSocket) -> None:
+    rt = get_bot_runtime_payload_sync()
+    max_conn = max(1, int(rt.get("ws_agent_assist_max_connections", 100)))
+    if not await ws_try_acquire("agent_assist_ws", max_conn):
+        await ws.accept()
+        await ws.send_json({"type": "error", "message": "too_many_connections"})
+        await ws.close(code=1013)
+        return
     await ws.accept()
     locale = ws.query_params.get("locale", "ru")
     session = AgentAssist()
@@ -61,6 +71,7 @@ async def agent_assist_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         log.info("agent_assist_disconnected")
     finally:
+        await ws_release("agent_assist_ws")
         try:
             await ws.close()
         except RuntimeError:

@@ -14,8 +14,10 @@ knowledge base. We enforce this in two places:
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
+import time
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
@@ -48,21 +50,59 @@ class RAGService:
         self._collection = collection_name
         self._dim = settings.openai_embedding_dim
         self._llm = get_llm()
+        self._ensured = False
+        self._ensure_lock = asyncio.Lock()
+        self._embed_cache: dict[str, tuple[float, list[float]]] = {}
 
     @property
     def collection_name(self) -> str:
         return self._collection
 
     async def ensure_collection(self) -> None:
-        existing = await self._client.get_collections()
-        names = {c.name for c in existing.collections}
-        if self._collection in names:
+        if self._ensured:
             return
-        await self._client.create_collection(
-            collection_name=self._collection,
-            vectors_config=qm.VectorParams(size=self._dim, distance=qm.Distance.COSINE),
-        )
-        log.info("qdrant_collection_created", name=self._collection)
+        async with self._ensure_lock:
+            if self._ensured:
+                return
+            existing = await self._client.get_collections()
+            names = {c.name for c in existing.collections}
+            if self._collection not in names:
+                await self._client.create_collection(
+                    collection_name=self._collection,
+                    vectors_config=qm.VectorParams(size=self._dim, distance=qm.Distance.COSINE),
+                )
+                log.info("qdrant_collection_created", name=self._collection)
+            self._ensured = True
+
+    def _embed_cache_get(self, query: str, *, ttl_sec: float) -> list[float] | None:
+        if ttl_sec <= 0:
+            return None
+        row = self._embed_cache.get(query)
+        if row is None:
+            return None
+        ts, vec = row
+        if (time.monotonic() - ts) > ttl_sec:
+            self._embed_cache.pop(query, None)
+            return None
+        return vec
+
+    def _embed_cache_put(self, query: str, vector: list[float], *, max_entries: int) -> None:
+        self._embed_cache[query] = (time.monotonic(), vector)
+        if len(self._embed_cache) <= max_entries:
+            return
+        oldest_k = min(self._embed_cache.items(), key=lambda kv: kv[1][0])[0]
+        self._embed_cache.pop(oldest_k, None)
+
+    async def _query_embedding(self, query: str, *, runtime: dict) -> list[float]:
+        cache_ttl = max(0.0, float(runtime.get("rag_query_embed_cache_ttl_sec", 300.0)))
+        cache_max = max(64, int(runtime.get("rag_query_embed_cache_max_entries", 4096)))
+        cached = self._embed_cache_get(query, ttl_sec=cache_ttl)
+        if cached is not None:
+            return cached
+        [vector] = await self._llm.embed([query])
+        self._embed_cache_put(query, vector, max_entries=cache_max)
+        return vector
+
 
     async def index_document(
         self,
@@ -113,11 +153,12 @@ class RAGService:
         locale: str | None = None,
         score_threshold: float | None = None,
     ) -> list[RAGChunk]:
-        await self.ensure_collection()
         if not query.strip():
             return []
+        if not self._ensured:
+            await self.ensure_collection()
         rt = get_bot_runtime_payload_sync()
-        [vector] = await self._llm.embed([query])
+        vector = await self._query_embedding(query, runtime=rt)
 
         flt: qm.Filter | None = None
         if locale:

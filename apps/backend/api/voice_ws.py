@@ -11,12 +11,15 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
 from apps.backend.config import get_settings
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.core import get_orchestrator
 from apps.backend.core.conversation_recorder import ConversationRecorder, create_conversation
 from apps.backend.core.voice_engine import VoiceEngine
 from apps.backend.models.db import session_scope
 from apps.backend.models.entities import Voice
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.ws_limits import release as ws_release
+from apps.backend.utils.ws_limits import try_acquire as ws_try_acquire
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -24,6 +27,13 @@ log = get_logger(__name__)
 
 @router.websocket("/ws/voice")
 async def voice_ws(ws: WebSocket) -> None:
+    rt = get_bot_runtime_payload_sync()
+    max_conn = max(1, int(rt.get("ws_voice_max_connections", 50)))
+    if not await ws_try_acquire("voice_ws", max_conn):
+        await ws.accept()
+        await ws.send_json({"type": "error", "message": "too_many_connections"})
+        await ws.close(code=1013)
+        return
     await ws.accept()
     locale = ws.query_params.get("locale", "ru")
     voice_id = ws.query_params.get("voice_id")
@@ -175,6 +185,7 @@ async def voice_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         log.info("voice_ws_client_disconnected")
     finally:
+        await ws_release("voice_ws")
         for task in (reader_task, writer_task, engine_task):
             task.cancel()
         for task in (reader_task, writer_task, engine_task):
