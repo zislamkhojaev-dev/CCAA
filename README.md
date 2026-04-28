@@ -17,7 +17,7 @@
 | Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                                                                              |
 | БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                                                                                |
 | STT        | Deepgram (WebSocket), OpenAI Whisper, `local_http`, моки + server-side VAD (Silero/WebRTC)                                                       |
-| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`all-MiniLM-L6-v2`) |
+| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`intfloat/multilingual-e5-small`) |
 | TTS        | ElevenLabs, OpenAI `tts-1`, `local_http`, моки                                                                                                   |
 | Контейнеры | Docker, Docker Compose                                                                                                                           |
 
@@ -217,7 +217,7 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 При первом использовании backend может автоматически скачать локальные артефакты:
 
 - **Silero VAD ONNX** (для `VOICE_VAD_BACKEND=silero_onnx`)
-- **MiniLM embeddings** (`sentence-transformers/all-MiniLM-L6-v2`) для semantic router/intent
+- **multilingual-e5-small embeddings** (`intfloat/multilingual-e5-small`) для semantic router/intent
 
 Это normal behavior: на холодном старте возможна небольшая задержка первого запроса. Для стабильного production обычно монтируют volume под кэш модели.
 
@@ -268,7 +268,7 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 
 ## Что важно перед production
 
-- Закрепить кэш моделей (Silero/MiniLM) через volume или prewarm на этапе деплоя.
+- Закрепить кэш моделей (Silero/e5-small) через volume или prewarm на этапе деплоя.
 - Добавить инфраструктурные метрики (Prometheus/Grafana) поверх текущих SLO-метрик API.
 - Настроить адаптеры внешних систем (телефония/CRM) поверх `/ws/voice` и REST API.
 

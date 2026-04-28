@@ -1,4 +1,4 @@
-"""Local MiniLM embeddings: semantic intent hints + orchestrator route classes (no LLM)."""
+"""Local embeddings for semantic intent/router (default: multilingual-e5-small)."""
 
 from __future__ import annotations
 
@@ -9,15 +9,14 @@ from typing import Sequence
 
 import numpy as np
 
+from apps.backend.config import get_settings
 from apps.backend.core.route_types import RouteClass, RouteDecision, RoutePolicy
 from apps.backend.models.schemas import IntentResult
 from apps.backend.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-
-# (intent_id, paraphrase) — RU/UZ mix; all-MiniLM is English-centric but still clusters short phrases.
+# (intent_id, paraphrase) — RU/UZ mix for multilingual semantic matching.
 INTENT_PROTOTYPES: list[tuple[str, str]] = [
     ("greeting", "здравствуйте"),
     ("greeting", "добрый день"),
@@ -97,6 +96,7 @@ _EXPLICIT_HANDOFF_SUBSTR: tuple[str, ...] = (
 
 _lock = threading.Lock()
 _embedder = None
+_embed_mode: str | None = None
 _intent_mat: np.ndarray | None = None
 _intent_ids: list[str] | None = None
 _route_mats: dict[str, np.ndarray] | None = None
@@ -109,19 +109,36 @@ def _l2n(v: np.ndarray) -> np.ndarray:
 
 
 def _get_embedder():
-    global _embedder, _embed_broken
+    global _embedder, _embed_broken, _embed_mode
     if _embed_broken:
         return None
+    model_id = (get_settings().semantic_embed_model or "").strip() or "intfloat/multilingual-e5-small"
     with _lock:
         if _embedder is None:
+            # fastembed currently supports a subset of models. For multilingual-e5-small
+            # we fall back to sentence-transformers.
             try:
                 from fastembed import TextEmbedding
 
-                _embedder = TextEmbedding(model_name=MODEL_ID)
+                _embedder = TextEmbedding(model_name=model_id)
+                _embed_mode = "fastembed"
             except Exception as exc:  # noqa: BLE001
-                log.warning("fastembed_init_failed", error=str(exc))
-                _embed_broken = True
-                return None
+                log.info("fastembed_init_skipped", model=model_id, error=str(exc))
+                try:
+                    from sentence_transformers import SentenceTransformer
+
+                    _embedder = SentenceTransformer(model_id, device="cpu")
+                    _embed_mode = "sentence_transformers"
+                except Exception as exc2:  # noqa: BLE001
+                    log.warning(
+                        "semantic_embed_init_failed",
+                        model=model_id,
+                        fastembed_error=str(exc),
+                        sentence_transformers_error=str(exc2),
+                    )
+                    _embed_broken = True
+                    return None
+            log.info("semantic_embed_model_loaded", model=model_id, mode=_embed_mode)
     return _embedder
 
 
@@ -130,10 +147,20 @@ def _embed_texts(texts: Sequence[str]) -> np.ndarray | None:
     if m is None:
         return None
     try:
-        rows = list(m.embed(list(texts), batch_size=32))
-        return np.stack([np.asarray(r, dtype=np.float32) for r in rows])
+        if _embed_mode == "fastembed":
+            rows = list(m.embed(list(texts), batch_size=32))
+            return np.stack([np.asarray(r, dtype=np.float32) for r in rows])
+        # sentence-transformers path
+        arr = m.encode(  # type: ignore[attr-defined]
+            list(texts),
+            batch_size=32,
+            convert_to_numpy=True,
+            normalize_embeddings=False,
+            show_progress_bar=False,
+        )
+        return np.asarray(arr, dtype=np.float32)
     except Exception as exc:  # noqa: BLE001
-        log.warning("fastembed_embed_failed", error=str(exc))
+        log.warning("semantic_embed_failed", mode=_embed_mode or "unknown", error=str(exc))
         return None
 
 

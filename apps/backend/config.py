@@ -94,6 +94,7 @@ class Settings(BaseSettings):
         "src/silero_vad/data/silero_vad.onnx"
     )
     silero_vad_cache_dir: str = ""
+    semantic_embed_model: str = "intfloat/multilingual-e5-small"
 
     # ----- Locales -----
     supported_locales: list[str] = Field(default_factory=lambda: ["ru", "uz"])
