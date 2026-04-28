@@ -11,15 +11,15 @@
 ## Стек
 
 
-| Слой       | Технология                                                                                                                                                     |
-| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Backend    | Python 3.11, FastAPI, asyncio, structlog                                                                                                                       |
-| Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                                                                                            |
-| БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                                                                                              |
-| STT        | Deepgram (WebSocket), OpenAI Whisper, `local_http`, моки + server-side VAD (Silero/WebRTC)                                                                     |
+| Слой       | Технология                                                                                                                                                                                                |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Backend    | Python 3.11, FastAPI, asyncio, structlog                                                                                                                                                                  |
+| Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                                                                                                                                       |
+| БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                                                                                                                                         |
+| STT        | Deepgram (WebSocket), OpenAI Whisper, `local_http`, моки + server-side VAD (Silero/WebRTC)                                                                                                                |
 | LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`intfloat/multilingual-e5-small`, `onnxruntime` + `tokenizers`, без `torch`) |
-| TTS        | ElevenLabs, OpenAI `tts-1`, `local_http`, моки                                                                                                                 |
-| Контейнеры | Docker, Docker Compose                                                                                                                                         |
+| TTS        | ElevenLabs, OpenAI `tts-1`, `local_http`, моки                                                                                                                                                            |
+| Контейнеры | Docker, Docker Compose                                                                                                                                                                                    |
 
 
 Все провайдеры спрятаны за **Strategy-интерфейсами** (`apps/backend/services/interfaces.py`).
@@ -240,6 +240,7 @@ RAG_SCORE_THRESHOLD=0.42
 ```
 
 Практика:
+
 - после изменения `RAG_CHUNK_*` нужно переиндексировать документы (удалить и загрузить заново),
 - `RAG_SCORE_THRESHOLD` регулирует строгость отбора чанков при поиске.
 
