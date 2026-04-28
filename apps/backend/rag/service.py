@@ -73,7 +73,11 @@ class RAGService:
         locale: str = "ru",
     ) -> int:
         await self.ensure_collection()
-        chunks = chunk_text(text)
+        chunks = chunk_text(
+            text,
+            max_tokens=max(64, int(get_settings().rag_chunk_max_tokens)),
+            overlap=max(0, int(get_settings().rag_chunk_overlap_tokens)),
+        )
         if not chunks:
             return 0
 
@@ -107,7 +111,7 @@ class RAGService:
         *,
         top_k: int = 5,
         locale: str | None = None,
-        score_threshold: float = 0.55,
+        score_threshold: float | None = None,
     ) -> list[RAGChunk]:
         await self.ensure_collection()
         if not query.strip():
@@ -122,11 +126,16 @@ class RAGService:
             )
 
         candidate_pool = max(top_k, int(rt.get("rag_candidate_pool_size", 20)))
+        threshold = (
+            float(score_threshold)
+            if score_threshold is not None
+            else float(get_settings().rag_score_threshold)
+        )
         hits = await self._client.search(
             collection_name=self._collection,
             query_vector=vector,
             limit=max(top_k * 2, candidate_pool),
-            score_threshold=score_threshold,
+            score_threshold=threshold,
             query_filter=flt,
         )
         candidates = [

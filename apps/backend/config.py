@@ -83,6 +83,9 @@ class Settings(BaseSettings):
     qdrant_collection: str = "knowledge_base"
     qdrant_collection_voice: str = "knowledge_base"
     qdrant_collection_agent_assist: str = "knowledge_agent_assist"
+    rag_chunk_max_tokens: int = 220
+    rag_chunk_overlap_tokens: int = 40
+    rag_score_threshold: float = 0.42
 
     # ----- Diarization (speech analytics; same contract for future batch jobs) -----
     diarization_provider: Literal["llm", "deepgram", "pyannote", "mock"] = "llm"
