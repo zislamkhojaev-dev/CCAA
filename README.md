@@ -17,7 +17,7 @@
 | Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                                                                                            |
 | БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                                                                                              |
 | STT        | Deepgram (WebSocket), OpenAI Whisper, `local_http`, моки + server-side VAD (Silero/WebRTC)                                                                     |
-| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`intfloat/multilingual-e5-small`, ONNX) |
+| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`intfloat/multilingual-e5-small`, `onnxruntime` + `tokenizers`, без `torch`) |
 | TTS        | ElevenLabs, OpenAI `tts-1`, `local_http`, моки                                                                                                                 |
 | Контейнеры | Docker, Docker Compose                                                                                                                                         |
 
@@ -217,9 +217,31 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 При первом использовании backend может автоматически скачать локальные артефакты:
 
 - **Silero VAD ONNX** (для `VOICE_VAD_BACKEND=silero_onnx`)
-- **multilingual-e5-small embeddings** (`intfloat/multilingual-e5-small`) для semantic router/intent
+- **multilingual-e5-small ONNX embeddings** (`intfloat/multilingual-e5-small`) для semantic router/intent
 
-Это normal behavior: на холодном старте возможна небольшая задержка первого запроса. Для стабильного production обычно монтируют volume под кэш модели.
+Это normal behavior: на холодном старте возможна задержка первого запроса. Для стабильного production обычно монтируют volume под кэш модели:
+
+```yaml
+backend:
+  volumes:
+    - ~/.cache/huggingface:/root/.cache/huggingface
+```
+
+Дополнительно на старте backend запускается prewarm semantic-индексов в фоне (API при этом не блокируется).
+
+## Тюнинг RAG для больших PDF
+
+Для объёмных и разнородных документов (например, многостраничных регламентов) можно настраивать чанкинг и порог retrieval через `.env`:
+
+```dotenv
+RAG_CHUNK_MAX_TOKENS=220
+RAG_CHUNK_OVERLAP_TOKENS=40
+RAG_SCORE_THRESHOLD=0.42
+```
+
+Практика:
+- после изменения `RAG_CHUNK_*` нужно переиндексировать документы (удалить и загрузить заново),
+- `RAG_SCORE_THRESHOLD` регулирует строгость отбора чанков при поиске.
 
 ## Поведение бота и голос (админка + API)
 
