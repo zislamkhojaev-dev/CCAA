@@ -2,28 +2,28 @@
 
 Прототип комплексной системы автоматизации КЦ согласно `Instruction.md`:
 
-- **Voice Bot** — входящая линия с пайплайном `Audio → STT → LLM → TTS → Audio` через WebSocket.
+- **Voice Bot** — входящая линия с пайплайном `Audio → VAD → STT → Router/Intent → LLM/Tools → TTS → Audio` через WebSocket.
 - **Agent Assist (суфлёр)** — отдельный **пул Qdrant** (`knowledge_agent_assist`) и свой RAG; не смешивается с базой голосового бота.
-- **Речевая аналитика** — загрузка записи: транскрипция (Whisper), диаризация через `**DiarizationService`** (`DIARIZATION_PROVIDER=llm|deepgram|pyannote|mock`): **deepgram** — batch `POST /v1/listen` с `diarize=true` и `utterances`; **pyannote** — опциональный **внешний HTTP-воркер** (см. ниже); **llm** — эвристика по сегментам ASR. Оценка по **настраиваемым критериям с весами**.
+- **Речевая аналитика** — загрузка записи: транскрипция (Whisper), диаризация через `DiarizationService` (`DIARIZATION_PROVIDER=llm|deepgram|pyannote|mock`): deepgram — batch `POST /v1/listen` с `diarize=true` и `utterances`; pyannote — внешний HTTP-воркер (см. ниже); llm — эвристика по сегментам ASR. Оценка по настраиваемым критериям с весами.
 - **Запись диалога бот–клиент** — таблицы `conversations` / `conversation_turns`: роли `customer` / `assistant`, эскалация с **саммари** и пакетом истории (`escalation_packet` по WebSocket + `GET /api/v1/conversations/{id}`).
-- **Control Plane** — Next.js админка: плейграунд, база знаний, промпты, голоса, **«Поведение бота»** (`/bot`) — температура LLM, окно истории, суффикс системного промпта, подавление повторных приветствий, дефолты TTS.
+- **Control Plane** — Next.js админка: плейграунд, база знаний, промпты, голоса, аналитика, **«Поведение бота»** (`/bot`) — VAD-пороги, семантический роутинг, intent policy, окно истории, дефолты TTS.
 
 ## Стек
 
 
-| Слой       | Технология                                                                                    |
-| ---------- | --------------------------------------------------------------------------------------------- |
-| Backend    | Python 3.11, FastAPI, asyncio, structlog                                                      |
-| Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                           |
-| БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                             |
-| STT        | Deepgram (WebSocket), OpenAI Whisper, `**local_http`**, моки                                  |
-| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `**local_http`** (Ollama / vLLM / LM Studio) |
-| TTS        | ElevenLabs, OpenAI `tts-1`, `**local_http`**, моки                                            |
-| Контейнеры | Docker, Docker Compose                                                                        |
+| Слой       | Технология                                                                                                                                       |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Backend    | Python 3.11, FastAPI, asyncio, structlog                                                                                                         |
+| Frontend   | Next.js 15, React 19, Tailwind CSS, shadcn-style UI                                                                                              |
+| БД         | PostgreSQL 16 (метаданные), Qdrant 1.12 (векторы)                                                                                                |
+| STT        | Deepgram (WebSocket), OpenAI Whisper, `local_http`, моки + server-side VAD (Silero/WebRTC)                                                       |
+| LLM        | OpenAI `gpt-4o-mini` + `text-embedding-3-small`, `local_http` (Ollama / vLLM / LM Studio), локальный semantic-intent/router (`all-MiniLM-L6-v2`) |
+| TTS        | ElevenLabs, OpenAI `tts-1`, `local_http`, моки                                                                                                   |
+| Контейнеры | Docker, Docker Compose                                                                                                                           |
 
 
 Все провайдеры спрятаны за **Strategy-интерфейсами** (`apps/backend/services/interfaces.py`).
-Замена API на локальные модели: встроенные варианты `**local_http`** (см. раздел ниже) или свой класс в `factory.py` — без правок call-flow.
+Замена API на локальные модели: встроенные варианты `local_http` (см. раздел ниже) или свой класс в `factory.py` — без правок call-flow.
 
 ## Структура
 
@@ -98,7 +98,16 @@ npm run dev
 ws://localhost:8000/api/v1/ws/voice?locale=ru&sample_rate=16000&voice_id=<UUID-профиля-из-таблицы-voices>
 ```
 
-Параметр `**voice_id**` (UUID строки `voices.id`) необязателен: если не указан, берётся голос с `is_default=true`, иначе — fallback из `.env` (`ELEVENLABS_VOICE_ID` / `OPENAI_TTS_VOICE`). Для выбранного профиля подставляются `**provider_voice_id**` и JSON `**tts_params**` (скорость OpenAI, stability ElevenLabs и т.д.).
+Параметр `voice_id` (UUID строки `voices.id`) необязателен: если не указан, берётся голос с `is_default=true`, иначе — fallback из `.env` (`ELEVENLABS_VOICE_ID` / `OPENAI_TTS_VOICE`). Для выбранного профиля подставляются `provider_voice_id` и JSON `tts_params` (скорость OpenAI, stability ElevenLabs и т.д.).
+
+VAD перед STT на сервере переключается через `.env`:
+
+```dotenv
+VOICE_VAD_BACKEND=silero_onnx   # или webrtc
+```
+
+- `silero_onnx` — ONNX-модель Silero (кэшируется локально на первом использовании).
+- `webrtc` — легковесный WebRTC VAD (режим агрессивности задаётся в runtime).
 
 Протокол:
 
@@ -145,7 +154,7 @@ curl -F "file=@knowledge.pdf" -F "title=Тарифы" -F "locale=ru" \
 ## Метрики и требования (из ФТ)
 
 - **Latency ≤ 1.5 c** — `timed_stage` логирует duration_ms каждого этапа (`stt`, `llm`, `tts`, `turn`).
-- **Intent accuracy ≥ 80%** — двухфазный детектор: keyword router + LLM-фолбэк.
+- **Intent accuracy ≥ 80%** — многоступенчато: semantic router (локальные эмбеддинги) + semantic intent + keyword/LLM-фолбэк.
 - **Локализация ru / uz** — системные промпты и фолбэки для обеих локалей.
 - **Безопасность** — никаких хардкодов; провайдеры заменяемы; данные при необходимости остаются в контуре.
 - **Webitel / Creatio** — точка интеграции = WebSocket `/ws/voice` (audio in/out) + REST CRUD; адаптер пишется поверх.
@@ -201,7 +210,16 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 | `TTS_PROVIDER=local_http` | `LOCAL_TTS_URL` — **POST** JSON `{"text","voice_id","locale"}`; тело ответа — бинарное аудио (целиком режется на чанки для WebSocket). Опционально в теле передаётся `tts_params` из профиля голоса.                                                      |
 
 
-Подробнее переменные перечислены в `**.env.example`**.
+Подробнее переменные перечислены в `.env.example`.
+
+## Локальные модели и кэш
+
+При первом использовании backend может автоматически скачать локальные артефакты:
+
+- **Silero VAD ONNX** (для `VOICE_VAD_BACKEND=silero_onnx`)
+- **MiniLM embeddings** (`sentence-transformers/all-MiniLM-L6-v2`) для semantic router/intent
+
+Это normal behavior: на холодном старте возможна небольшая задержка первого запроса. Для стабильного production обычно монтируют volume под кэш модели.
 
 ## Поведение бота и голос (админка + API)
 
@@ -211,24 +229,27 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 Типичные ключи в payload:
 
 
-| Ключ                                                  | Смысл                                                                                                                      |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `llm_temperature`, `llm_max_tokens`                   | Параметры генерации в оркестраторе и SSE-плейграунде.                                                                      |
-| `history_max_messages`                                | Сколько последних сообщений истории уходит в LLM (и обрезка буфера в Voice Engine).                                        |
-| `system_prompt_suffix`                                | Дополнительный блок в системном промпте (политика компании и т.п.).                                                        |
-| `suppress_repeated_greeting`                          | Если `true` и в истории уже есть реплики ассистента — в промпт добавляется правило не начинать ответ с приветствия заново. |
-| `openai_tts_speed`                                    | Скорость синтеза OpenAI TTS (0.25–4.0), пока не переопределено в профиле голоса.                                           |
-| `elevenlabs_stability`, `elevenlabs_similarity_boost` | Аналогично для ElevenLabs.                                                                                                 |
+| Ключ                                                       | Смысл                                                                                                                      |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `llm_temperature`, `llm_max_tokens`                        | Параметры генерации в оркестраторе и SSE-плейграунде.                                                                      |
+| `history_max_messages`                                     | Сколько последних сообщений истории уходит в LLM (и обрезка буфера в Voice Engine).                                        |
+| `system_prompt_suffix`                                     | Дополнительный блок в системном промпте (политика компании и т.п.).                                                        |
+| `suppress_repeated_greeting`                               | Если `true` и в истории уже есть реплики ассистента — в промпт добавляется правило не начинать ответ с приветствия заново. |
+| `openai_tts_speed`                                         | Скорость синтеза OpenAI TTS (0.25–4.0), пока не переопределено в профиле голоса.                                           |
+| `elevenlabs_stability`, `elevenlabs_similarity_boost`      | Аналогично для ElevenLabs.                                                                                                 |
+| `vad_silero_speech_threshold`, `vad_webrtc_aggressiveness` | Порог/чувствительность server-side VAD перед STT (Silero/WebRTC).                                                          |
+| `semantic_router_embed_enabled`, `router_embed_`*          | Локальный семантический роутер (noise/simple/complex/escalation) по косинусному сходству.                                  |
+| `semantic_intent_embed_enabled`, `semantic_intent_`*       | Локальная semantic intent-классификация до keyword/LLM-фолбэка.                                                            |
 
 
-**Профиль голоса:** в таблице `voices` есть колонка `**tts_params`** (JSONB). В админке «Голоса» — поле под каждым профилем; API: `**PATCH /api/v1/voices/{id}`** с телом `{"tts_params":{...}}`. Переопределения: например `{"speed":1.1}` для OpenAI, `{"stability":0.4,"similarity_boost":0.8}` для ElevenLabs.
+**Профиль голоса:** в таблице `voices` есть колонка `tts_params` (JSONB). В админке «Голоса» — поле под каждым профилем; API: `PATCH /api/v1/voices/{id}` с телом `{"tts_params":{...}}`. Переопределения: например `{"speed":1.1}` для OpenAI, `{"stability":0.4,"similarity_boost":0.8}` для ElevenLabs.
 
-После миграции `**0005_bot_runtime_voice_tts`** выполните `alembic upgrade head`.
+После миграции `0005_bot_runtime_voice_tts` выполните `alembic upgrade head`.
 
 ## Диаризация в аналитике: Deepgram и pyannote
 
-- `**DIARIZATION_PROVIDER=deepgram`** — в сервис аналитики передаётся сырой файл записи; бэкенд вызывает `**POST https://api.deepgram.com/v1/listen`** с `diarize=true`, `utterances=true`, парсит `results.utterances` и мапит в `DiarizedTurn`. Нужен `**DEEPGRAM_API_KEY`**. Эвристика спикеров: **0 → agent**, **1 → customer** (типичный порядок в моно-звонке); при одном спикере — роль `unknown`.
-- `**DIARIZATION_PROVIDER=pyannote`** — тяжёлая модель **не** встроена в образ API. Ожидается отдельный сервис по адресу `**PYANNOTE_WORKER_URL`**: POST `multipart/form-data`, поле `**file`** — то же аудио, что загрузил пользователь. Ответ **JSON**:
+- `DIARIZATION_PROVIDER=deepgram` — в сервис аналитики передаётся сырой файл записи; бэкенд вызывает `POST https://api.deepgram.com/v1/listen` с `diarize=true`, `utterances=true`, парсит `results.utterances` и мапит в `DiarizedTurn`. Нужен `DEEPGRAM_API_KEY`. Эвристика спикеров: `0 → agent`, `1 → customer` (типичный порядок в моно-звонке); при одном спикере — роль `unknown`.
+- `DIARIZATION_PROVIDER=pyannote` — тяжёлая модель не встроена в образ API. Ожидается отдельный сервис по адресу `PYANNOTE_WORKER_URL`: POST `multipart/form-data`, поле `file` — то же аудио, что загрузил пользователь. Ответ JSON:
 
 ```json
 {
@@ -245,11 +266,9 @@ TTS_PROVIDER=openai      # tts-1, голос alloy / nova / ...
 
 `speaker` — одно из: `customer`, `agent`, `unknown`. Если URL пуст или воркер недоступен, пайплайн не падает: возвращается один блок с полным текстом транскрипта и `unknown`. Такой воркер обычно поднимают в контейнере **с GPU** и очередью задач (Celery, Redis, отдельный микросервис).
 
-## Roadmap прототипа
+## Что важно перед production
 
-1. Узбекская модель STT (Deepgram `multi` или локальный Whisper).
-2. Adapter Webitel ↔ `/ws/voice` (intake/выдача аудио).
-3. Adapter Creatio (CRM lookup на старте сессии).
-4. Метрики Prometheus + дашборд латентности.
-5. Realtime API OpenAI вместо Whisper batch — приблизит к 1.5 c без Deepgram.
+- Закрепить кэш моделей (Silero/MiniLM) через volume или prewarm на этапе деплоя.
+- Добавить инфраструктурные метрики (Prometheus/Grafana) поверх текущих SLO-метрик API.
+- Настроить адаптеры внешних систем (телефония/CRM) поверх `/ws/voice` и REST API.
 
