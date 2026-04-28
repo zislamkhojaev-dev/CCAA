@@ -21,6 +21,7 @@ from deepgram import (
 from apps.backend.config import get_settings
 from apps.backend.services.interfaces import STTEvent, STTService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker
 
 log = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class DeepgramSTT(STTService):
             DeepgramClientOptions(options={"keepalive": "true"}),
         )
         self._model = settings.deepgram_model
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=20.0)
 
     async def stream_transcribe(
         self,
@@ -43,6 +45,9 @@ class DeepgramSTT(STTService):
         locale: str = "ru",
         sample_rate: int = 16_000,
     ) -> AsyncIterator[STTEvent]:
+        if not await self._breaker.before_call():
+            log.warning("deepgram_stt_circuit_open")
+            return
         connection = self._client.listen.asyncwebsocket.v("1")
         out_queue: asyncio.Queue[STTEvent | None] = asyncio.Queue()
 
@@ -85,7 +90,9 @@ class DeepgramSTT(STTService):
         )
 
         if not await connection.start(options):
+            await self._breaker.on_failure()
             raise RuntimeError("Failed to start Deepgram connection")
+        await self._breaker.on_success()
 
         async def pump_audio() -> None:
             try:

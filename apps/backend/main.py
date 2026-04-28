@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from apps.backend.api import api_router
 from apps.backend.config import get_settings
-from apps.backend.core.bot_runtime import get_bot_runtime_payload
+from apps.backend.core.bot_runtime import get_bot_runtime_payload, periodic_bot_runtime_refresh
 from apps.backend.core.semantic_local import prewarm_semantic_embeddings
 from apps.backend.models.db import init_db
 from apps.backend.rag import get_rag_agent_assist, get_rag_voice
@@ -54,9 +54,18 @@ async def lifespan(app: FastAPI):
             log.warning("semantic_embed_prewarm_failed", error=str(exc))
 
     # Do not block API startup on first-time model download.
-    asyncio.create_task(_run_semantic_prewarm())
+    prewarm_task = asyncio.create_task(_run_semantic_prewarm())
+    refresh_stop = asyncio.Event()
+    refresh_task = asyncio.create_task(periodic_bot_runtime_refresh(refresh_stop))
     log.info("semantic_embed_prewarm_started")
     yield
+    refresh_stop.set()
+    for task in (prewarm_task, refresh_task):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     log.info("shutdown")
 
 

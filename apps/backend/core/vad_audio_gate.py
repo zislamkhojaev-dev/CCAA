@@ -103,6 +103,8 @@ async def pcm_vad_gate_stream(
 
     rt = runtime_get()
     min_voiced_sec = max(0.05, float(rt.get("stt_min_voiced_seconds", 0.2)))
+    prebuffer_sec = max(0.05, float(rt.get("vad_prebuffer_sec", 0.3)))
+    hangover_sec = max(0.05, float(rt.get("vad_hangover_sec", 0.25)))
     silero_thr = float(rt.get("vad_silero_speech_threshold", 0.45))
     webrtc_aggr = int(rt.get("vad_webrtc_aggressiveness", 2))
 
@@ -122,8 +124,11 @@ async def pcm_vad_gate_stream(
 
     raw = bytearray()
     min_voiced_bytes = int(sample_rate * 2 * min_voiced_sec)
+    prebuffer_max_bytes = int(sample_rate * 2 * prebuffer_sec)
+    hangover_max_bytes = int(sample_rate * 2 * hangover_sec)
     prebuffer = bytearray()
     voiced_run = 0
+    non_speech_run = 0
     in_speech = False
 
     async for chunk in audio_in:
@@ -137,8 +142,11 @@ async def pcm_vad_gate_stream(
             speech = p >= silero_thr if backend == "silero_onnx" else p >= 0.5
             if speech:
                 voiced_run += len(frame)
+                non_speech_run = 0
                 if not in_speech:
                     prebuffer.extend(frame)
+                    if len(prebuffer) > prebuffer_max_bytes:
+                        del prebuffer[: len(prebuffer) - prebuffer_max_bytes]
                     if voiced_run >= min_voiced_bytes:
                         in_speech = True
                         if prebuffer:
@@ -148,7 +156,14 @@ async def pcm_vad_gate_stream(
                     yield frame
                 continue
             if in_speech:
-                yield frame
+                if non_speech_run < hangover_max_bytes:
+                    yield frame
+                non_speech_run += len(frame)
+                if non_speech_run >= hangover_max_bytes:
+                    in_speech = False
+                    voiced_run = 0
+                    non_speech_run = 0
+                    prebuffer.clear()
             else:
                 prebuffer.clear()
                 voiced_run = 0

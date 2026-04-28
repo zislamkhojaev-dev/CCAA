@@ -21,6 +21,7 @@ from apps.backend.config import get_settings
 from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.services.interfaces import STTEvent, STTService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker, retry_async
 
 log = get_logger(__name__)
 
@@ -35,6 +36,7 @@ class LocalHttpSTT(STTService):
         self._silence_ms = s.openai_stt_silence_ms
         # Полный URL в `LOCAL_STT_URL` (без базового префикса клиента).
         self._client = httpx.AsyncClient(timeout=120.0)
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=15.0)
 
     async def stream_transcribe(
         self,
@@ -65,9 +67,17 @@ class LocalHttpSTT(STTService):
             wav = _pcm16_to_wav(bytes(buf), sample_rate=sample_rate)
             buf.clear()
             voiced_bytes = 0
+            if not await self._breaker.before_call():
+                log.warning("local_stt_circuit_open")
+                return
             try:
                 files = {"file": ("speech.wav", wav, "audio/wav")}
-                r = await self._client.post(self._url, files=files, data={"language": locale})
+                r = await retry_async(
+                    lambda: self._client.post(
+                        self._url, files=files, data={"language": locale}
+                    ),
+                    attempts=2,
+                )
                 r.raise_for_status()
                 data = r.json()
                 text = (
@@ -77,7 +87,9 @@ class LocalHttpSTT(STTService):
                 if text:
                     log.info("local_stt_flush", reason=reason, len=len(text))
                     await out_q.put(STTEvent(text=text, is_final=True, confidence=0.9))
+                await self._breaker.on_success()
             except Exception as exc:  # noqa: BLE001
+                await self._breaker.on_failure()
                 log.error("local_stt_error", error=str(exc))
 
         voiced_bytes = 0

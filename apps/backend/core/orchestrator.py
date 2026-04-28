@@ -512,6 +512,8 @@ class Orchestrator:
             return _AgentResult(answer="")
         rt = get_bot_runtime_payload_sync()
         max_steps = max(1, int(rt.get("agent_tool_loop_max_steps", 3)))
+        budget_ms = max(100, int(rt.get("agent_tool_loop_budget_ms", 1200)))
+        deadline = time.monotonic() + (budget_ms / 1000.0)
         messages = self.build_messages(text, history, sources, locale)
         messages[0] = ChatMessage(
             role="system",
@@ -525,21 +527,39 @@ class Orchestrator:
             ),
         )
         for _ in range(max_steps):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log.warning("agent_tool_loop_budget_exceeded", budget_ms=budget_ms)
+                return _AgentResult(answer=fallback_message_soft(locale))
             raw = ""
             native_calls: list[dict] = []
             if rt.get("native_function_calling_enabled", True):
-                raw, native_calls = await self._llm.complete_with_tools(
-                    messages,
-                    tools=_TOOL_SCHEMAS,
-                    temperature=float(rt.get("llm_temperature", 0.2)),
-                    max_tokens=int(rt.get("llm_max_tokens", 300)),
-                )
+                try:
+                    raw, native_calls = await asyncio.wait_for(
+                        self._llm.complete_with_tools(
+                            messages,
+                            tools=_TOOL_SCHEMAS,
+                            temperature=float(rt.get("llm_temperature", 0.2)),
+                            max_tokens=int(rt.get("llm_max_tokens", 300)),
+                        ),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning("agent_tool_loop_llm_timeout", budget_ms=budget_ms)
+                    return _AgentResult(answer=fallback_message_soft(locale))
             else:
-                raw = await self._llm.complete(
-                    messages,
-                    temperature=float(rt.get("llm_temperature", 0.2)),
-                    max_tokens=int(rt.get("llm_max_tokens", 300)),
-                )
+                try:
+                    raw = await asyncio.wait_for(
+                        self._llm.complete(
+                            messages,
+                            temperature=float(rt.get("llm_temperature", 0.2)),
+                            max_tokens=int(rt.get("llm_max_tokens", 300)),
+                        ),
+                        timeout=remaining,
+                    )
+                except TimeoutError:
+                    log.warning("agent_tool_loop_llm_timeout", budget_ms=budget_ms)
+                    return _AgentResult(answer=fallback_message_soft(locale))
             if native_calls:
                 tool_name = str(native_calls[0].get("name") or "")
                 args = native_calls[0].get("arguments") or {}
@@ -701,7 +721,17 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="empty_or_silence",
         )
-    if any(k in t for k in ("оператор", "человек", "human", "agent", "переключи", "позови")):
+    try:
+        from apps.backend.core import semantic_local as sem
+
+        explicit_handoff = sem.is_explicit_handoff(t)
+        smalltalk = sem.match_smalltalk_keyword(t)
+    except Exception:  # noqa: BLE001
+        explicit_handoff = any(
+            k in t for k in ("оператор", "человек", "human", "agent", "переключи", "позови")
+        )
+        smalltalk = None
+    if explicit_handoff:
         return RouteDecision(
             route_class=RouteClass.ESCALATION,
             confidence=esc_conf,
@@ -710,7 +740,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=True,
             reason="explicit_handoff_request",
         )
-    if any(k in t for k in ("привет", "здравств", "добрый", "hello", "hi", "salom", "assalomu")):
+    if smalltalk == "greeting":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -719,7 +749,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="smalltalk_greeting",
         )
-    if any(k in t for k in ("спасибо", "благодар", "rahmat", "thank")):
+    if smalltalk == "thanks":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -728,7 +758,7 @@ def _semantic_router_keywords(text: str, *, locale: str, runtime: dict) -> Route
             requires_human=False,
             reason="smalltalk_thanks",
         )
-    if any(k in t for k in ("пока", "до свид", "goodbye", "bye", "xayr")):
+    if smalltalk == "goodbye":
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=0.95,
@@ -818,6 +848,9 @@ class AgentWorkflowGraph:
 def _pick_variant(options: list[str]) -> str:
     if not options:
         return ""
+    rt = get_bot_runtime_payload_sync()
+    if bool(rt.get("smalltalk_deterministic_enabled", False)):
+        return options[0]
     # Small non-deterministic variation so greetings are less repetitive.
     return random.choice(options)
 

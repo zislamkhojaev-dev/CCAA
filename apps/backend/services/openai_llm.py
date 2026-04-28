@@ -10,6 +10,7 @@ from apps.backend.config import get_settings
 from apps.backend.models.schemas import ChatMessage
 from apps.backend.services.interfaces import LLMService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker, retry_async
 
 log = get_logger(__name__)
 
@@ -22,6 +23,7 @@ class OpenAILLM(LLMService):
         self._client = AsyncOpenAI(api_key=settings.openai_api_key)
         self._model = settings.openai_model
         self._embed_model = settings.openai_embedding_model
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=20.0)
 
     @staticmethod
     def _to_openai(messages: Sequence[ChatMessage]) -> list[dict]:
@@ -34,13 +36,24 @@ class OpenAILLM(LLMService):
         temperature: float = 0.2,
         max_tokens: int = 512,
     ) -> str:
-        resp = await self._client.chat.completions.create(
-            model=self._model,
-            messages=self._to_openai(messages),
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        return (resp.choices[0].message.content or "").strip()
+        if not await self._breaker.before_call():
+            log.warning("openai_llm_circuit_open", operation="complete")
+            return ""
+        try:
+            resp = await retry_async(
+                lambda: self._client.chat.completions.create(
+                    model=self._model,
+                    messages=self._to_openai(messages),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                ),
+                attempts=2,
+            )
+            await self._breaker.on_success()
+            return (resp.choices[0].message.content or "").strip()
+        except Exception:  # noqa: BLE001
+            await self._breaker.on_failure()
+            raise
 
     async def stream_complete(
         self,
@@ -67,10 +80,21 @@ class OpenAILLM(LLMService):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         if not texts:
             return []
-        resp = await self._client.embeddings.create(
-            model=self._embed_model, input=list(texts)
-        )
-        return [d.embedding for d in resp.data]
+        if not await self._breaker.before_call():
+            log.warning("openai_llm_circuit_open", operation="embed")
+            return []
+        try:
+            resp = await retry_async(
+                lambda: self._client.embeddings.create(
+                    model=self._embed_model, input=list(texts)
+                ),
+                attempts=2,
+            )
+            await self._breaker.on_success()
+            return [d.embedding for d in resp.data]
+        except Exception:  # noqa: BLE001
+            await self._breaker.on_failure()
+            raise
 
     async def complete_with_tools(
         self,
@@ -80,14 +104,25 @@ class OpenAILLM(LLMService):
         temperature: float = 0.2,
         max_tokens: int = 512,
     ) -> tuple[str, list[dict]]:
-        resp = await self._client.chat.completions.create(
-            model=self._model,
-            messages=self._to_openai(messages),
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            tool_choice="auto",
-        )
+        if not await self._breaker.before_call():
+            log.warning("openai_llm_circuit_open", operation="complete_with_tools")
+            return "", []
+        try:
+            resp = await retry_async(
+                lambda: self._client.chat.completions.create(
+                    model=self._model,
+                    messages=self._to_openai(messages),
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    tool_choice="auto",
+                ),
+                attempts=2,
+            )
+            await self._breaker.on_success()
+        except Exception:  # noqa: BLE001
+            await self._breaker.on_failure()
+            raise
         msg = resp.choices[0].message
         text = (msg.content or "").strip()
         out_calls: list[dict] = []

@@ -404,10 +404,10 @@ class VoiceEngine:
                             )
                             resolved_answer = (answer or "").strip()
                             if resolved_answer and not escalation_reason:
-                                rt = get_bot_runtime_payload_sync()
-                                batch_chars = max(20, int(rt.get("tts_micro_batch_chars", 48)))
-                                for batch in _to_micro_batches(resolved_answer, batch_chars=batch_chars):
-                                    await text_q.put(batch)
+                                # Готовый ответ отдаём целиком: TTS-провайдер сам нарежет
+                                # на предложения и стримит chunks без gap. Микробатчинг здесь
+                                # только увеличивал число HTTP-запросов и резал звук на части.
+                                await text_q.put(resolved_answer)
                     except asyncio.CancelledError:
                         raise
                     finally:
@@ -673,9 +673,12 @@ def _is_low_signal_text(text: str) -> bool:
 
 
 def _low_signal_message(locale: str) -> str:
+    rt = get_bot_runtime_payload_sync()
     if locale == "uz":
-        return "Mayli, kutaman. Qisqacha ayting, qaysi savol bo‘yicha yordam kerak."
-    return "Хорошо, я на линии. Коротко подскажите, с каким вопросом помочь?"
+        custom = str(rt.get("low_signal_message_uz") or "").strip()
+        return custom or "Mayli, kutaman. Qisqacha ayting, qaysi savol bo‘yicha yordam kerak."
+    custom = str(rt.get("low_signal_message_ru") or "").strip()
+    return custom or "Хорошо, я на линии. Коротко подскажите, с каким вопросом помочь?"
 
 
 class CallState(str, Enum):

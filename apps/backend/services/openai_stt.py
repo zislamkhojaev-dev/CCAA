@@ -27,6 +27,7 @@ from apps.backend.config import get_settings
 from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.services.interfaces import STTEvent, STTService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker, retry_async
 
 log = get_logger(__name__)
 
@@ -47,6 +48,7 @@ class OpenAIWhisperSTT(STTService):
         self._model = settings.openai_stt_model
         self._flush_ms = settings.openai_stt_flush_ms
         self._silence_ms = settings.openai_stt_silence_ms
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=20.0)
 
     async def stream_transcribe(
         self,
@@ -77,13 +79,19 @@ class OpenAIWhisperSTT(STTService):
             wav_bytes = _pcm16_to_wav(bytes(buf), sample_rate=sample_rate)
             buf = bytearray()
             voiced_bytes = 0
+            if not await self._breaker.before_call():
+                log.warning("openai_stt_circuit_open")
+                return
             try:
-                resp = await self._client.audio.transcriptions.create(
-                    model=self._model,
-                    file=("speech.wav", wav_bytes, "audio/wav"),
-                    language=locale if locale in {"ru", "en"} else "ru",
-                    response_format="json",
-                    temperature=0,
+                resp = await retry_async(
+                    lambda: self._client.audio.transcriptions.create(
+                        model=self._model,
+                        file=("speech.wav", wav_bytes, "audio/wav"),
+                        language=locale if locale in {"ru", "en"} else "ru",
+                        response_format="json",
+                        temperature=0,
+                    ),
+                    attempts=2,
                 )
                 text = _normalize_text(resp.text or "")
                 if text:
@@ -98,7 +106,9 @@ class OpenAIWhisperSTT(STTService):
                     last_emit_at = now
                     log.info("whisper_flush", reason=reason, text_len=len(text))
                     await out_q.put(STTEvent(text=text, is_final=True, confidence=0.9))
+                await self._breaker.on_success()
             except Exception as exc:  # noqa: BLE001
+                await self._breaker.on_failure()
                 log.error("whisper_error", error=str(exc))
 
         async def consumer() -> None:

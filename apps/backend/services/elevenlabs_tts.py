@@ -16,6 +16,7 @@ from apps.backend.config import get_settings
 from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.services.interfaces import TTSService
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.resilience import SimpleCircuitBreaker
 
 log = get_logger(__name__)
 
@@ -30,6 +31,7 @@ class ElevenLabsTTS(TTSService):
         self._api_key = settings.elevenlabs_api_key
         self._model = settings.elevenlabs_model
         self._client = httpx.AsyncClient(timeout=30.0)
+        self._breaker = SimpleCircuitBreaker(fail_threshold=3, open_sec=20.0)
 
     async def stream_synthesize(
         self,
@@ -59,11 +61,15 @@ class ElevenLabsTTS(TTSService):
                 yield tail
 
         async for sentence in iter_sentences():
-            payload = await self._synth_one(sentence, voice_id, voice_tts_params)
-            if payload:
-                yield payload
+            async for chunk in self._synth_one(sentence, voice_id, voice_tts_params):
+                yield chunk
 
-    async def _synth_one(self, text: str, voice_id: str, voice_tts_params: dict | None) -> bytes:
+    async def _synth_one(
+        self,
+        text: str,
+        voice_id: str,
+        voice_tts_params: dict | None,
+    ) -> AsyncIterator[bytes]:
         rt = get_bot_runtime_payload_sync()
         v = voice_tts_params or {}
         try:
@@ -89,28 +95,40 @@ class ElevenLabsTTS(TTSService):
             "model_id": self._model,
             "voice_settings": {"stability": stability, "similarity_boost": similarity},
         }
+        if not await self._breaker.before_call():
+            log.warning("elevenlabs_tts_circuit_open")
+            return
         try:
-            out = bytearray()
-            async with self._client.stream(
-                "POST", url, headers=headers, json=payload
-            ) as resp:
-                if resp.status_code >= 400:
-                    body = await resp.aread()
-                    log.error(
-                        "tts_http_error",
-                        status=resp.status_code,
-                        body=body[:200].decode("utf-8", "replace"),
-                    )
-                    return b""
-                async for chunk in resp.aiter_bytes():
-                    if chunk:
-                        out.extend(chunk)
-            return bytes(out)
+            for attempt in range(2):
+                had_chunks = False
+                async with self._client.stream(
+                    "POST", url, headers=headers, json=payload
+                ) as resp:
+                    if resp.status_code >= 500 and attempt == 0:
+                        # Retry once on transient provider failures before yielding audio.
+                        continue
+                    if resp.status_code >= 400:
+                        body = await resp.aread()
+                        log.error(
+                            "tts_http_error",
+                            status=resp.status_code,
+                            body=body[:200].decode("utf-8", "replace"),
+                        )
+                        await self._breaker.on_failure()
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            had_chunks = True
+                            yield chunk
+                if had_chunks:
+                    await self._breaker.on_success()
+                return
         except asyncio.CancelledError:
             raise
         except httpx.HTTPError as exc:
+            await self._breaker.on_failure()
             log.warning("tts_stream_interrupted", error=str(exc))
-            return b""
+            return
 
     async def aclose(self) -> None:
         await self._client.aclose()

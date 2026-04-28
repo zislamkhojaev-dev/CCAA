@@ -44,7 +44,7 @@ services:
       interval: 60s
       timeout: 3s
       retries: 20
-      start_period: 10s
+      start_period: 90s
     ports:
       - "8000:8000"
 

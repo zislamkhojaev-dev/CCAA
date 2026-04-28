@@ -11,12 +11,15 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
 
 from apps.backend.config import get_settings
+from apps.backend.core.bot_runtime import get_bot_runtime_payload_sync
 from apps.backend.core import get_orchestrator
 from apps.backend.core.conversation_recorder import ConversationRecorder, create_conversation
 from apps.backend.core.voice_engine import VoiceEngine
 from apps.backend.models.db import session_scope
 from apps.backend.models.entities import Voice
 from apps.backend.utils.logging import get_logger
+from apps.backend.utils.ws_limits import release as ws_release
+from apps.backend.utils.ws_limits import try_acquire as ws_try_acquire
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -24,6 +27,36 @@ log = get_logger(__name__)
 
 @router.websocket("/ws/voice")
 async def voice_ws(ws: WebSocket) -> None:
+    rt = get_bot_runtime_payload_sync()
+    acquired_scopes: list[str] = []
+    max_global = max(1, int(rt.get("ws_voice_max_connections", 50)))
+    ip = (ws.client.host if ws.client else "") or "unknown"
+    token = str(ws.query_params.get("token") or ws.query_params.get("session_token") or "").strip()
+    scopes: list[tuple[str, int]] = [("voice_ws", max_global)]
+    scopes.append(
+        (
+            f"voice_ws:ip:{ip}",
+            max(1, int(rt.get("ws_voice_max_connections_per_ip", 8))),
+        )
+    )
+    if token:
+        scopes.append(
+            (
+                f"voice_ws:token:{token}",
+                max(1, int(rt.get("ws_voice_max_connections_per_token", 4))),
+            )
+        )
+    for scope, limit in scopes:
+        ok = await ws_try_acquire(scope, limit)
+        if ok:
+            acquired_scopes.append(scope)
+            continue
+        for acq in reversed(acquired_scopes):
+            await ws_release(acq)
+        await ws.accept()
+        await ws.send_json({"type": "error", "message": "too_many_connections"})
+        await ws.close(code=1013)
+        return
     await ws.accept()
     locale = ws.query_params.get("locale", "ru")
     voice_id = ws.query_params.get("voice_id")
@@ -175,6 +208,8 @@ async def voice_ws(ws: WebSocket) -> None:
     except WebSocketDisconnect:
         log.info("voice_ws_client_disconnected")
     finally:
+        for scope in reversed(acquired_scopes):
+            await ws_release(scope)
         for task in (reader_task, writer_task, engine_task):
             task.cancel()
         for task in (reader_task, writer_task, engine_task):
