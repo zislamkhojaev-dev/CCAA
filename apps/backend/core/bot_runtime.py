@@ -55,6 +55,8 @@ DEFAULT_PAYLOAD: dict[str, Any] = {
     "semantic_intent_human_min_cos": 0.58,
     "semantic_intent_human_greeting_ambiguity_max_gap": 0.15,
     "router_embed_escalation_vs_smalltalk_margin": 0.04,
+    "router_smalltalk_max_words": 3,
+    "router_smalltalk_vs_knowledge_margin": 0.03,
     "low_signal_reply_enabled": True,
     # Earlier TTS kickoff from smaller text batches.
     "tts_micro_batch_chars": 40,

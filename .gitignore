@@ -31,3 +31,6 @@ Thumbs.db
 # Local data
 pgdata/
 qdrant_storage/
+.venv-hf/
+
+

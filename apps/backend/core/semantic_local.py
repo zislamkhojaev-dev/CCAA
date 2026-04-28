@@ -5,9 +5,13 @@ from __future__ import annotations
 import re
 import threading
 from collections import defaultdict
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 
 from apps.backend.config import get_settings
 from apps.backend.core.route_types import RouteClass, RouteDecision, RoutePolicy
@@ -97,10 +101,59 @@ _EXPLICIT_HANDOFF_SUBSTR: tuple[str, ...] = (
 _lock = threading.Lock()
 _embedder = None
 _embed_mode: str | None = None
+_embed_registration: str | None = None
 _intent_mat: np.ndarray | None = None
 _intent_ids: list[str] | None = None
 _route_mats: dict[str, np.ndarray] | None = None
 _embed_broken = False
+_E5_MAX_LENGTH = 512
+
+
+class OnnxE5Embedder:
+    def __init__(self, model_id: str) -> None:
+        onnx_path = hf_hub_download(repo_id=model_id, filename="onnx/model.onnx")
+        tokenizer_path = hf_hub_download(repo_id=model_id, filename="tokenizer.json")
+        self.model_path = str(Path(onnx_path).resolve())
+        self.tokenizer_path = str(Path(tokenizer_path).resolve())
+        self.tokenizer = Tokenizer.from_file(self.tokenizer_path)
+        self.session = ort.InferenceSession(
+            self.model_path,
+            providers=["CPUExecutionProvider"],
+        )
+        self.input_names = {inp.name for inp in self.session.get_inputs()}
+
+    def embed(self, texts: Sequence[str], *, batch_size: int = 32) -> list[np.ndarray]:
+        out: list[np.ndarray] = []
+        for i in range(0, len(texts), batch_size):
+            batch = list(texts[i : i + batch_size])
+            if not batch:
+                continue
+            enc = self.tokenizer.encode_batch(batch)
+            input_ids = [e.ids[:_E5_MAX_LENGTH] for e in enc]
+            attention_mask = [e.attention_mask[:_E5_MAX_LENGTH] for e in enc]
+            # Pad to the same sequence length for ONNX.
+            max_len = int(max(len(row) for row in input_ids))
+            padded_ids = np.zeros((len(batch), max_len), dtype=np.int64)
+            padded_mask = np.zeros((len(batch), max_len), dtype=np.int64)
+            for r, (ids, mask) in enumerate(zip(input_ids, attention_mask, strict=False)):
+                ln = len(ids)
+                padded_ids[r, :ln] = np.asarray(ids, dtype=np.int64)
+                padded_mask[r, :ln] = np.asarray(mask, dtype=np.int64)
+
+            feed: dict[str, np.ndarray] = {
+                "input_ids": padded_ids,
+                "attention_mask": padded_mask,
+            }
+            if "token_type_ids" in self.input_names:
+                feed["token_type_ids"] = np.zeros_like(padded_ids, dtype=np.int64)
+
+            hidden = self.session.run(None, feed)[0]  # [B, T, H]
+            mask = padded_mask.astype(np.float32)[..., None]  # [B, T, 1]
+            summed = (hidden * mask).sum(axis=1)
+            denom = np.clip(mask.sum(axis=1), 1e-9, None)
+            pooled = summed / denom
+            out.extend(np.asarray(row, dtype=np.float32) for row in pooled)
+        return out
 
 
 def _l2n(v: np.ndarray) -> np.ndarray:
@@ -109,36 +162,34 @@ def _l2n(v: np.ndarray) -> np.ndarray:
 
 
 def _get_embedder():
-    global _embedder, _embed_broken, _embed_mode
+    global _embedder, _embed_broken, _embed_mode, _embed_registration
     if _embed_broken:
         return None
     model_id = (get_settings().semantic_embed_model or "").strip() or "intfloat/multilingual-e5-small"
-    with _lock:
+
+    if _embedder is not None:
+        return _embedder
+    if not _lock.acquire(blocking=False):
+        # Another request/background task is initializing model now.
+        return None
+    try:
         if _embedder is None:
-            # fastembed currently supports a subset of models. For multilingual-e5-small
-            # we fall back to sentence-transformers.
             try:
-                from fastembed import TextEmbedding
-
-                _embedder = TextEmbedding(model_name=model_id)
-                _embed_mode = "fastembed"
+                _embedder = OnnxE5Embedder(model_id)
+                _embed_mode = "onnxruntime"
+                _embed_registration = "hf_onnx"
             except Exception as exc:  # noqa: BLE001
-                log.info("fastembed_init_skipped", model=model_id, error=str(exc))
-                try:
-                    from sentence_transformers import SentenceTransformer
-
-                    _embedder = SentenceTransformer(model_id, device="cpu")
-                    _embed_mode = "sentence_transformers"
-                except Exception as exc2:  # noqa: BLE001
-                    log.warning(
-                        "semantic_embed_init_failed",
-                        model=model_id,
-                        fastembed_error=str(exc),
-                        sentence_transformers_error=str(exc2),
-                    )
-                    _embed_broken = True
-                    return None
-            log.info("semantic_embed_model_loaded", model=model_id, mode=_embed_mode)
+                log.warning("semantic_embed_init_failed", model=model_id, error=str(exc))
+                _embed_broken = True
+                return None
+            log.info(
+                "semantic_embed_model_loaded",
+                model=model_id,
+                mode=_embed_mode,
+                registration=_embed_registration or "unknown",
+            )
+    finally:
+        _lock.release()
     return _embedder
 
 
@@ -147,18 +198,8 @@ def _embed_texts(texts: Sequence[str]) -> np.ndarray | None:
     if m is None:
         return None
     try:
-        if _embed_mode == "fastembed":
-            rows = list(m.embed(list(texts), batch_size=32))
-            return np.stack([np.asarray(r, dtype=np.float32) for r in rows])
-        # sentence-transformers path
-        arr = m.encode(  # type: ignore[attr-defined]
-            list(texts),
-            batch_size=32,
-            convert_to_numpy=True,
-            normalize_embeddings=False,
-            show_progress_bar=False,
-        )
-        return np.asarray(arr, dtype=np.float32)
+        rows = m.embed(list(texts), batch_size=32)  # type: ignore[attr-defined]
+        return np.stack([np.asarray(r, dtype=np.float32) for r in rows])
     except Exception as exc:  # noqa: BLE001
         log.warning("semantic_embed_failed", mode=_embed_mode or "unknown", error=str(exc))
         return None
@@ -313,8 +354,17 @@ def route_by_embedding(text: str, *, locale: str, runtime: dict) -> RouteDecisio
 
     words = len(re.sub(r"[^\w\s]", " ", t).split())
 
+    smalltalk_max_words = max(1, int(runtime.get("router_smalltalk_max_words", 3)))
+    smalltalk_margin = float(runtime.get("router_smalltalk_vs_knowledge_margin", 0.03))
+
     # Сначала smalltalk: иначе ложный s_esc на «Привет!» даёт ESCALATION до приветствия.
-    if s_gr >= thr_sm and s_gr >= s_th and s_gr >= s_by:
+    if (
+        words <= smalltalk_max_words
+        and s_gr >= thr_sm
+        and s_gr >= s_th
+        and s_gr >= s_by
+        and s_gr >= (s_kn + smalltalk_margin)
+    ):
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=s_gr,
@@ -323,7 +373,13 @@ def route_by_embedding(text: str, *, locale: str, runtime: dict) -> RouteDecisio
             requires_human=False,
             reason="semantic_embed_greeting",
         )
-    if s_th >= thr_sm and s_th >= s_gr and s_th >= s_by:
+    if (
+        words <= smalltalk_max_words
+        and s_th >= thr_sm
+        and s_th >= s_gr
+        and s_th >= s_by
+        and s_th >= (s_kn + smalltalk_margin)
+    ):
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=s_th,
@@ -332,7 +388,7 @@ def route_by_embedding(text: str, *, locale: str, runtime: dict) -> RouteDecisio
             requires_human=False,
             reason="semantic_embed_thanks",
         )
-    if s_by >= thr_sm:
+    if words <= smalltalk_max_words and s_by >= thr_sm and s_by >= (s_kn + smalltalk_margin):
         return RouteDecision(
             route_class=RouteClass.SIMPLE,
             confidence=s_by,
@@ -406,3 +462,21 @@ def route_by_embedding(text: str, *, locale: str, runtime: dict) -> RouteDecisio
         requires_human=False,
         reason="semantic_embed_complex",
     )
+
+
+def prewarm_semantic_embeddings() -> bool:
+    """Best-effort warmup: initialize embedder and build route/intent indexes."""
+    try:
+        if _get_embedder() is None:
+            return False
+        ok_intent = _ensure_intent_index()
+        ok_route = _ensure_route_mats()
+        log.info(
+            "semantic_embed_prewarm_done",
+            intent_index_ready=ok_intent,
+            route_index_ready=ok_route,
+        )
+        return ok_intent and ok_route
+    except Exception as exc:  # noqa: BLE001
+        log.warning("semantic_embed_prewarm_failed", error=str(exc))
+        return False
